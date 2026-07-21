@@ -1,0 +1,44 @@
+{
+  "k": 3,
+  "cases": [
+    {
+      "case_id": "agent-framework-selection",
+      "relevant_documents": ["langgraph-docs", "langgraph-checkpoint", "crewai-docs"],
+      "retrieved_documents": ["langgraph-docs", "blog-comparison", "langgraph-checkpoint"],
+      "expected_citations": ["https://docs.langchain.com/langgraph", "https://github.com/langchain-ai/langgraph"],
+      "generated_citations": ["https://docs.langchain.com/langgraph", "https://github.com/langchain-ai/langgraph"],
+      "supported_citations": ["https://docs.langchain.com/langgraph", "https://github.com/langchain-ai/langgraph"],
+      "task_success": true,
+      "latency_ms": 18400,
+      "input_tokens": 12600,
+      "output_tokens": 3200,
+      "cost_usd": 0.052
+    },
+    {
+      "case_id": "rag-stack-selection",
+      "relevant_documents": ["qdrant-filtering", "milvus-hybrid", "elastic-security"],
+      "retrieved_documents": ["milvus-hybrid", "qdrant-filtering", "vendor-blog"],
+      "expected_citations": ["https://qdrant.tech/documentation", "https://milvus.io/docs"],
+      "generated_citations": ["https://qdrant.tech/documentation", "https://example.com/vendor-blog"],
+      "supported_citations": ["https://qdrant.tech/documentation"],
+      "task_success": true,
+      "latency_ms": 23100,
+      "input_tokens": 14800,
+      "output_tokens": 3900,
+      "cost_usd": 0.061
+    },
+    {
+      "case_id": "observability-selection",
+      "relevant_documents": ["langfuse-eval", "phoenix-tracing"],
+      "retrieved_documents": ["generic-observability", "langfuse-eval", "phoenix-tracing"],
+      "expected_citations": ["https://langfuse.com/docs", "https://docs.arize.com/phoenix"],
+      "generated_citations": ["https://langfuse.com/docs"],
+      "supported_citations": ["https://langfuse.com/docs"],
+      "task_success": false,
+      "latency_ms": 30100,
+      "input_tokens": 17100,
+      "output_tokens": 4100,
+      "cost_usd": 0.073
+    }
+  ]
+}

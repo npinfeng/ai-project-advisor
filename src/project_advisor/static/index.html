@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="AI 技术选型与开源项目评估多智能体系统">
+  <title>AI Project Advisor</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="noise"></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="AI Project Advisor 首页">
+      <span class="brand-mark">PA</span>
+      <span>
+        <strong>Project Advisor</strong>
+        <small>Evidence-driven AI decisions</small>
+      </span>
+    </a>
+    <div class="service-status" id="serviceStatus">
+      <span class="status-dot"></span>
+      <span>服务检查中</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <span class="eyebrow">MULTI-AGENT RESEARCH SYSTEM</span>
+        <h1>把技术选型，<br><span class="headline-ink">从“凭感觉”变成</span><br><span>有证据的决策</span></h1>
+        <p>描述你的业务约束，多个 AI Agent 将并行研究 GitHub、官方文档与社区信息，生成带评分和来源的技术选型报告。</p>
+      </div>
+      <div class="hero-metrics" aria-label="系统能力">
+        <div><strong>4</strong><span>核心 Agent</span></div>
+        <div><strong>7</strong><span>评分维度</span></div>
+        <div><strong>2</strong><span>检索通道</span></div>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <form class="panel input-panel" id="advisorForm">
+        <div class="panel-heading">
+          <div>
+            <span class="step-number">01</span>
+            <h2>定义评估任务</h2>
+          </div>
+          <span class="panel-tag">INPUT</span>
+        </div>
+
+        <label for="question">你的技术需求</label>
+        <textarea id="question" name="question" rows="9" required minlength="10">我们团队使用 Python，需要开发一个支持多智能体协作、RAG、人工审批和持久化状态的 AI 应用，希望可以私有化部署。请从功能匹配、工程可靠性、学习成本和社区活跃度等维度推荐合适的开源框架。</textarea>
+        <div class="field-meta">
+          <span>建议写清语言、团队经验、部署方式和硬性能力</span>
+          <span id="charCount">0 / 5000</span>
+        </div>
+
+        <label for="candidates">候选项目 <span>可选，用逗号分隔</span></label>
+        <input id="candidates" name="candidates" value="LangGraph, CrewAI, Microsoft Agent Framework" placeholder="例如：LangGraph, CrewAI">
+
+        <div class="examples">
+          <span>快速示例</span>
+          <button type="button" data-example="agent">Agent 框架</button>
+          <button type="button" data-example="rag">RAG 技术栈</button>
+          <button type="button" data-example="observability">LLM 可观测性</button>
+        </div>
+
+        <div class="form-actions">
+          <button class="primary-button" id="submitButton" type="submit">
+            <span>开始深度评估</span>
+            <span class="button-arrow">→</span>
+          </button>
+          <button class="secondary-button" id="cancelButton" type="button" hidden>停止任务</button>
+        </div>
+        <p class="form-error" id="formError" role="alert"></p>
+      </form>
+
+      <section class="panel process-panel" aria-live="polite">
+        <div class="panel-heading">
+          <div>
+            <span class="step-number">02</span>
+            <h2>Agent 工作流</h2>
+          </div>
+          <span class="panel-tag" id="runState">READY</span>
+        </div>
+
+        <ol class="timeline" id="timeline">
+          <li data-node="clarify_requirements">
+            <span class="timeline-icon">01</span>
+            <div><strong>需求解析</strong><small>提取约束与目标</small></div>
+            <span class="timeline-state">等待</span>
+          </li>
+          <li data-node="plan_evaluation">
+            <span class="timeline-icon">02</span>
+            <div><strong>生成评估计划</strong><small>确定候选项与研究维度</small></div>
+            <span class="timeline-state">等待</span>
+          </li>
+          <li data-node="research_supervisor">
+            <span class="timeline-icon">03</span>
+            <div><strong>并行证据研究</strong><small>仓库数据、文档与 RAG 检索</small></div>
+            <span class="timeline-state">等待</span>
+          </li>
+          <li data-node="review_and_score">
+            <span class="timeline-icon">04</span>
+            <div><strong>证据审查与评分</strong><small>七维加权评分与冲突检查</small></div>
+            <span class="timeline-state">等待</span>
+          </li>
+          <li data-node="generate_report">
+            <span class="timeline-icon">05</span>
+            <div><strong>生成最终报告</strong><small>结论、风险与引用溯源</small></div>
+            <span class="timeline-state">等待</span>
+          </li>
+        </ol>
+
+        <div class="idle-card" id="idleCard">
+          <span class="radar"><i></i><i></i><i></i></span>
+          <p>提交任务后，这里会实时展示每个 Agent 的执行状态。</p>
+        </div>
+      </section>
+    </section>
+
+    <section class="results" id="results" hidden>
+      <div class="results-heading">
+        <div>
+          <span class="eyebrow">EVALUATION OUTPUT</span>
+          <h2>评估结果</h2>
+        </div>
+        <div>
+          <button class="text-button" id="copyButton" type="button">复制报告</button>
+          <button class="text-button" id="downloadButton" type="button">下载 Markdown</button>
+        </div>
+      </div>
+      <div class="score-grid" id="scoreGrid"></div>
+      <article class="report" id="report"></article>
+    </section>
+  </main>
+
+  <footer>
+    <span>Built with LangGraph · Hybrid RAG · FastAPI · SSE</span>
+    <span>AI 输出应结合原始证据复核</span>
+  </footer>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
