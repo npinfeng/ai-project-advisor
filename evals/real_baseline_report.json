@@ -11,5 +11,15 @@
   "latency_p50_ms": 27000.0,
   "latency_p95_ms": 34680.0,
   "average_tokens": 21220.0,
-  "average_cost_usd": 0.0792
+  "average_cost_usd": 0.0792,
+  "dataset_name": "synthetic-demo-10-cases",
+  "dataset_kind": "synthetic",
+  "annotation_status": "reviewed",
+  "is_publishable": false,
+  "quality_warnings": [
+    "frontend-framework-2025: expected/generated/supported citations 完全相同，需确认引用经过独立审核。",
+    "message-queue-async: expected/generated/supported citations 完全相同，需确认引用经过独立审核。",
+    "python-web-framework: expected/generated/supported citations 完全相同，需确认引用经过独立审核。",
+    "distributed-cache: expected/generated/supported citations 完全相同，需确认引用经过独立审核。"
+  ]
 }

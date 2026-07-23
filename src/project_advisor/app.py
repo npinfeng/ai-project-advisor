@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from project_advisor.configuration import Configuration
-from project_advisor.evaluation import evaluate_file
+from project_advisor.evaluation import evaluate_cases, load_evaluation_bundle
 from project_advisor.mcp_client import get_mcp_diagnostics
 
 load_dotenv()
@@ -92,6 +92,30 @@ def _serialize_scores(scores: list[Any]) -> list[dict[str, Any]]:
         score.model_dump() if hasattr(score, "model_dump") else dict(score)
         for score in scores
     ]
+
+
+def _serialize_evidences(evidences: list[Any]) -> list[dict[str, Any]]:
+    """Expose only stable retrieval provenance needed by evaluation runners."""
+    serialized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for evidence in evidences:
+        value = (
+            evidence.model_dump()
+            if hasattr(evidence, "model_dump")
+            else dict(evidence)
+        )
+        evidence_id = str(value.get("evidence_id", ""))
+        if not evidence_id or evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+        serialized.append({
+            "evidence_id": evidence_id,
+            "source_url": value.get("source_url", ""),
+            "source_type": value.get("source_type", ""),
+            "project_name": value.get("project_name", ""),
+            "relevance": value.get("relevance", ""),
+        })
+    return serialized
 
 
 def _build_question(payload: AdviceRequest) -> str:
@@ -230,6 +254,7 @@ async def _stream_graph(
     }
     final_report = ""
     scores: list[dict[str, Any]] = []
+    retrieved_evidences: list[dict[str, Any]] = []
     started_at = time.perf_counter()
     stage_started_at = started_at
     stage_durations_ms: dict[str, int] = {}
@@ -274,6 +299,9 @@ async def _stream_graph(
                 output_tokens += update_output
                 if node_name == "review_and_score":
                     scores = _serialize_scores(output.get("scores", []))
+                if output.get("evidences"):
+                    combined = [*retrieved_evidences, *output.get("evidences", [])]
+                    retrieved_evidences = _serialize_evidences(combined)
                 if node_name == "generate_report":
                     final_report = output.get("final_report", "")
 
@@ -299,6 +327,7 @@ async def _stream_graph(
                 {
                     "report": final_report,
                     "scores": scores,
+                    "retrieved_evidences": retrieved_evidences,
                     "diagnostics": _build_runtime_diagnostics(
                         started_at=started_at,
                         stage_durations_ms=stage_durations_ms,
@@ -340,7 +369,17 @@ async def evaluation_dashboard() -> dict[str, Any]:
     """Return the latest reproducible offline-evaluation baseline."""
     evaluation_path = _evaluation_file()
     try:
-        report = evaluate_file(evaluation_path)
+        bundle = load_evaluation_bundle(evaluation_path)
+        report = None
+        status_message = ""
+        if bundle.metadata.annotation_status == "reviewed":
+            report = evaluate_cases(
+                bundle.cases,
+                k=bundle.k,
+                metadata=bundle.metadata,
+            )
+        else:
+            status_message = "真实运行已采集，等待独立人工审核后计算质量指标。"
         modified_at = datetime.fromtimestamp(
             evaluation_path.stat().st_mtime,
             tz=timezone.utc,
@@ -351,8 +390,11 @@ async def evaluation_dashboard() -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="离线评测文件格式无效。") from error
     return {
         "source": evaluation_path.name,
+        "metadata": bundle.metadata.model_dump(),
+        "k": bundle.k,
+        "status_message": status_message,
         "updated_at": modified_at,
-        "report": report.model_dump(),
+        "report": report.model_dump() if report is not None else None,
     }
 
 

@@ -15,6 +15,7 @@ dist/
 build/
 
 data/
+evals/runs/*.pending.json
 .DS_Store
 .idea/
 .vscode/

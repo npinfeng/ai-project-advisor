@@ -226,11 +226,17 @@ function renderDiagnostics(diagnostics) {
 
 function renderEvaluation(payload) {
   const report = payload.report || {};
+  const metadata = payload.metadata || {};
+  const hasReport = Boolean(payload.report);
   const percentageMetrics = new Set([
     "recall_at_k", "precision_at_k", "mrr", "ndcg_at_k",
     "citation_accuracy", "citation_coverage", "task_success_rate",
   ]);
   document.querySelectorAll("[data-eval]").forEach((element) => {
+    if (!hasReport) {
+      element.textContent = "—";
+      return;
+    }
     const key = element.dataset.eval;
     const value = Number(report[key] || 0);
     if (percentageMetrics.has(key)) element.textContent = `${(value * 100).toFixed(1)}%`;
@@ -239,8 +245,19 @@ function renderEvaluation(payload) {
     else element.textContent = value.toLocaleString("zh-CN", { maximumFractionDigits: 1 });
   });
   const updatedAt = payload.updated_at ? new Date(payload.updated_at).toLocaleString("zh-CN") : "未知";
-  evaluationMeta.textContent = `${payload.source} · K=${report.k} · 更新于 ${updatedAt}`;
-  evaluationState.textContent = "READY";
+  const stateLabels = {
+    synthetic: "DEMO",
+    fixture: "FIXTURE",
+    real_run: metadata.annotation_status === "reviewed" ? "REVIEWED" : "PENDING",
+  };
+  const warning = report.quality_warnings?.length
+    ? ` · ${report.quality_warnings.length} 条质量警告`
+    : "";
+  const statusMessage = payload.status_message ? ` · ${payload.status_message}` : "";
+  evaluationMeta.textContent = `${metadata.display_name || payload.source} · K=${report.k ?? payload.k} · 更新于 ${updatedAt}${warning}${statusMessage}`;
+  evaluationState.textContent = metadata.is_publishable
+    ? "PUBLISHED"
+    : (stateLabels[metadata.dataset_kind] || "UNVERIFIED");
 }
 
 function setRunning(running) {

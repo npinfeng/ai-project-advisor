@@ -1,6 +1,7 @@
 """Tests for the connected workflow topology and web demo."""
 
 import importlib
+import json
 
 from fastapi.testclient import TestClient
 
@@ -82,7 +83,21 @@ class FakeGraph:
     async def astream(self, *args, **kwargs):
         yield {"clarify_requirements": {"next": "plan_evaluation"}}
         yield {"plan_evaluation": {"candidates": ["LangGraph"]}}
-        yield {"research_supervisor": {"notes": ["Evidence"]}}
+        yield {
+            "research_supervisor": {
+                "notes": ["Evidence"],
+                "evidences": [
+                    Evidence(
+                        source_url="https://docs.example.com/langgraph",
+                        source_type="official_documentation",
+                        project_name="LangGraph",
+                        content="Durable execution evidence.",
+                        relevance="checkpoint",
+                        retrieved_at="2026-07-23T08:00:00+00:00",
+                    )
+                ],
+            }
+        }
         yield {
             "review_and_score": {
                 "scores": [
@@ -123,6 +138,8 @@ def test_web_app_and_sse_stream(monkeypatch):
     assert evaluation_response.status_code == 200
     evaluation_payload = evaluation_response.json()
     assert evaluation_payload["source"] == "real_results.json"
+    assert evaluation_payload["metadata"]["dataset_kind"] == "synthetic"
+    assert evaluation_payload["metadata"]["is_publishable"] is False
     assert evaluation_payload["report"]["case_count"] == 10
     assert evaluation_payload["report"]["latency_p95_ms"] >= evaluation_payload["report"]["latency_p50_ms"]
 
@@ -146,6 +163,43 @@ def test_web_app_and_sse_stream(monkeypatch):
     assert '"stage_duration_ms"' in body
     assert '"stage_durations_ms"' in body
     assert '"token_usage"' in body
+    assert '"retrieved_evidences"' in body
+    assert '"evidence_id"' in body
+
+
+def test_pending_evaluation_is_visible_without_fake_metrics(
+    monkeypatch, tmp_path
+):
+    app_module = importlib.import_module("project_advisor.app")
+    pending_file = tmp_path / "pending.json"
+    pending_file.write_text(
+        json.dumps({
+            "k": 5,
+            "metadata": {
+                "dataset_name": "run-pending",
+                "display_name": "真实运行（待审核）",
+                "dataset_kind": "real_run",
+                "annotation_status": "pending",
+                "annotation_method": "none",
+                "is_publishable": False,
+            },
+            "cases": [{
+                "case_id": "case-1",
+                "latency_ms": 10,
+                "task_success": None,
+            }],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EVALUATION_FILE", str(pending_file))
+
+    response = TestClient(app_module.app).get("/api/evaluation")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["metadata"]["annotation_status"] == "pending"
+    assert payload["report"] is None
+    assert "等待独立人工审核" in payload["status_message"]
 
 
 def test_candidate_suggestion_preview(monkeypatch):

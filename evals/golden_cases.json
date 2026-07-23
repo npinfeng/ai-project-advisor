@@ -1,0 +1,104 @@
+{
+  "suite_name": "project-advisor-golden-v1",
+  "version": "1.0.0",
+  "ground_truth_status": "draft_human_review_required",
+  "k": 5,
+  "cases": [
+    {
+      "case_id": "agent-framework-selection",
+      "question": "我们是 5 人 Python 团队，需要构建支持多智能体、人工审批、持久化状态和私有化部署的企业 AI 应用。请比较 LangGraph、CrewAI、Microsoft AutoGen、DSPy 和 Haystack。",
+      "candidates": ["LangGraph", "CrewAI", "Microsoft AutoGen", "DSPy", "Haystack"],
+      "relevant_documents": [
+        "https://docs.langchain.com/oss/python/langgraph/overview",
+        "https://docs.crewai.com/",
+        "https://microsoft.github.io/autogen/stable/"
+      ],
+      "expected_citations": [
+        "https://docs.langchain.com/oss/python/langgraph/overview",
+        "https://docs.crewai.com/",
+        "https://microsoft.github.io/autogen/stable/"
+      ],
+      "success_criteria": "覆盖全部候选项目，给出七维评分、风险、证据来源和明确推荐。"
+    },
+    {
+      "case_id": "rag-stack-selection",
+      "question": "为 200 万段中文企业文档选择可自托管 RAG 技术栈，要求混合检索、权限过滤和增量更新。请比较 Qdrant、Milvus、Elasticsearch、Weaviate 和 OpenSearch。",
+      "candidates": ["Qdrant", "Milvus", "Elasticsearch", "Weaviate", "OpenSearch"],
+      "relevant_documents": [
+        "https://qdrant.tech/documentation/",
+        "https://milvus.io/docs",
+        "https://www.elastic.co/docs/solutions/search"
+      ],
+      "expected_citations": [
+        "https://qdrant.tech/documentation/",
+        "https://milvus.io/docs",
+        "https://www.elastic.co/docs/solutions/search"
+      ],
+      "success_criteria": "比较过滤、混合检索、扩展性和运维成本，并说明适用边界。"
+    },
+    {
+      "case_id": "llm-observability-selection",
+      "question": "团队需要统一管理 LLM Trace、Prompt 版本、离线评测和线上反馈，并要求支持私有化部署。请比较 Langfuse、Phoenix、MLflow、Helicone 和 LangSmith。",
+      "candidates": ["Langfuse", "Phoenix", "MLflow", "Helicone", "LangSmith"],
+      "relevant_documents": [
+        "https://langfuse.com/docs",
+        "https://arize.com/docs/phoenix",
+        "https://mlflow.org/docs/latest/llms/"
+      ],
+      "expected_citations": [
+        "https://langfuse.com/docs",
+        "https://arize.com/docs/phoenix",
+        "https://mlflow.org/docs/latest/llms/"
+      ],
+      "success_criteria": "覆盖追踪、评测、反馈、部署方式和成本，不把 SaaS 能力误写为开源自托管能力。"
+    },
+    {
+      "case_id": "python-api-framework",
+      "question": "选择 Python REST API 框架，候选为 FastAPI、Litestar、Flask 和 Django。重点比较异步能力、类型安全、生态、部署复杂度和文档质量。",
+      "candidates": ["FastAPI", "Litestar", "Flask", "Django"],
+      "relevant_documents": [
+        "https://fastapi.tiangolo.com/",
+        "https://docs.litestar.dev/",
+        "https://docs.djangoproject.com/"
+      ],
+      "expected_citations": [
+        "https://fastapi.tiangolo.com/",
+        "https://docs.litestar.dev/",
+        "https://docs.djangoproject.com/"
+      ],
+      "success_criteria": "区分微框架与全栈框架，给出与团队需求一致的推荐。"
+    },
+    {
+      "case_id": "message-queue-selection",
+      "question": "为异步事件处理选择消息系统，请比较 Apache Kafka、Redpanda、RabbitMQ、NATS 和 Apache Pulsar 的投递保证、吞吐、运维复杂度和生态。",
+      "candidates": ["Apache Kafka", "Redpanda", "RabbitMQ", "NATS", "Apache Pulsar"],
+      "relevant_documents": [
+        "https://kafka.apache.org/documentation/",
+        "https://www.rabbitmq.com/docs",
+        "https://docs.nats.io/"
+      ],
+      "expected_citations": [
+        "https://kafka.apache.org/documentation/",
+        "https://www.rabbitmq.com/docs",
+        "https://docs.nats.io/"
+      ],
+      "success_criteria": "说明日志流与传统消息队列的差异，并依据负载特点推荐。"
+    },
+    {
+      "case_id": "distributed-cache-selection",
+      "question": "为高并发业务选择分布式缓存，请比较 Redis、Dragonfly、Microsoft Garnet 和 Memcached 的吞吐、集群、持久化、兼容性和运维工具。",
+      "candidates": ["Redis", "Dragonfly", "Microsoft Garnet", "Memcached"],
+      "relevant_documents": [
+        "https://redis.io/docs/latest/",
+        "https://www.dragonflydb.io/docs",
+        "https://microsoft.github.io/garnet/docs/"
+      ],
+      "expected_citations": [
+        "https://redis.io/docs/latest/",
+        "https://www.dragonflydb.io/docs",
+        "https://microsoft.github.io/garnet/docs/"
+      ],
+      "success_criteria": "准确区分协议兼容、持久化与集群能力，并说明迁移风险。"
+    }
+  ]
+}

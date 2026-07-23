@@ -124,30 +124,13 @@ MCP_SERVERS_JSON={"company":{"transport":"streamable_http","url":"https://mcp.ex
 
 ## 离线评测
 
-项目提供两套评测数据集：
+评测数据现在显式记录来源、标注状态和可发布状态，避免把模型运行结果反向复制成标准答案。仓库包含三类文件：
 
-- `evals/sample_results.json` — 3 个固定 Case 的轻量测试夹具，用于快速验证指标公式。
-- `evals/real_results.json` — 默认看板使用的 10 个技术选型场景模拟数据。
+- `evals/sample_results.json`：3 个 Case 的公式测试夹具，状态为 `FIXTURE`。
+- `evals/real_results.json`：10 个 Case 的模拟演示数据，状态为 `DEMO`；名称为兼容旧配置而保留，不代表真实运行基线。
+- `evals/golden_cases.json`：运行前写好的 6 个真实评测题目、候选项目、相关文档、期望引用和成功标准。当前 ground truth 仍需人工复核。
 
-运行评测：
-
-```powershell
-# 演示数据集（K=3）
-C:\miniconda\envs\agent\python.exe -m project_advisor.evaluation --input evals\sample_results.json
-
-# 真实场景数据集（K=5）
-C:\miniconda\envs\agent\python.exe -m project_advisor.evaluation --input evals\real_results.json --output evals\real_baseline_report.json
-```
-
-也可使用安装后的命令：
-
-```powershell
-project-advisor-eval --input evals\real_results.json
-```
-
-Web 看板默认读取 `evals/real_results.json`，因此启动后会展示 10 个 Case。需要切换数据集时可设置 `EVALUATION_FILE`。
-
-### 真实场景基线（10 Case，`K=5`）
+### 模拟演示指标（10 Case，`K=5`）
 
 | 指标 | 结果 |
 | --- | ---: |
@@ -162,9 +145,40 @@ Web 看板默认读取 `evals/real_results.json`，因此启动后会展示 10 �
 | 平均 Token | 21,220.00 |
 | 平均成本 | $0.0792 |
 
-真实场景覆盖了前端框架选型、数据库选型、消息队列、Python Web 框架、可观测性、容器编排、搜索引擎、GraphQL vs REST、分布式缓存和 LLM 编排框架共 10 个技术选型方向。其中搜索引擎和 GraphQL vs REST 两个 Case 设为任务失败，反映这两类场景在实际系统中的高难度。
+这些数值只用于演示指标、CLI 和看板接线，不能作为线上效果或正式基线发布。看板会明确显示 `DEMO`，并展示数据质量警告数。
 
-### 演示基线（3 Case，`K=3`）
+运行演示评测：
+
+```powershell
+C:\miniconda\envs\agent\python.exe -m project_advisor.evaluation --input evals\real_results.json
+```
+
+若命令用于发布流程，请添加 `--require-publishable`；模拟数据、待审核数据和未通过门禁的数据都会被拒绝。
+
+### 生成并审核真实运行数据
+
+先启动 Web 服务，再按以下闭环执行：
+
+```powershell
+# 1. 执行预先定义的 6 个 Case；只采集实际 Evidence、报告、延迟、Token 和成本
+C:\miniconda\envs\agent\python.exe scripts\capture_eval_results.py
+
+# 2. 独立人工核对引用支持情况和任务成功标准
+C:\miniconda\envs\agent\python.exe scripts\annotate_eval_results.py `
+  --input evals\runs\run-时间戳.pending.json `
+  --annotator "审核人姓名"
+
+# 3. 仅对通过来源与人工审核门禁的文件生成正式指标
+C:\miniconda\envs\agent\python.exe -m project_advisor.evaluation `
+  --input evals\runs\run-时间戳.reviewed.json `
+  --require-publishable
+```
+
+采集脚本不会自动填写 `supported_citations` 或 `task_success`。只有 `real_run`、`reviewed`、`independent_human`、具名审核人且已确认 golden ground truth 的文件，才能标记为 `is_publishable=true`。
+
+真实运行的 SSE 结果包含 `retrieved_evidences`，每条记录使用工作流实际产生的 `evidence_id` 和 `source_url`。评测脚本不再从报告标题推测检索文档，也不再把检索结果复制进相关文档标签。
+
+### 测试夹具指标（3 Case，`K=3`）
 
 | 指标 | 结果 |
 | --- | ---: |
@@ -179,11 +193,7 @@ Web 看板默认读取 `evals/real_results.json`，因此启动后会展示 10 �
 | 平均 Token | 18,566.67 |
 | 平均成本 | $0.062 |
 
-这组数据用于演示指标公式、CLI 和看板接线，不代表线上生产效果。
-
-### 接入真实运行结果
-
-将每次实际运行的检索结果、引用支持判断、usage 和延迟按 `EvaluationCase` Schema 写入 JSON 文件，通过 `EVALUATION_FILE` 环境变量指向该文件，Web 看板将自动展示最新基线。Schema 定义见 [evaluation.py](src/project_advisor/evaluation.py)。
+Web 看板默认仍读取 `evals/real_results.json`，因此显示 `DEMO`。将 `EVALUATION_FILE` 指向审核后的运行文件即可展示最新结果；只有通过发布门禁的文件显示 `PUBLISHED`。Schema 和门禁定义见 [evaluation.py](src/project_advisor/evaluation.py)。
 
 ## 测试
 
@@ -192,7 +202,7 @@ C:\miniconda\envs\agent\python.exe -m pytest tests -v -p no:cacheprovider
 ```
 
 MCP 集成测试会实际启动内置 stdio Server、发现工具并调用 `estimate_llm_cost`，不是 Mock 测试。
-当前完整回归结果为 `22 passed`，其中新增测试覆盖 Evidence 重启恢复、BM25 持久化、Chroma Collection 恢复及重复入库幂等性。
+当前完整回归结果为 `29 passed`。测试覆盖 Evidence 重启恢复、BM25/Chroma 持久化、重复入库幂等性、SSE 真实 Evidence 采集、待审核门禁、独立人工标注和循环标签防护。
 
 ## 故障降级演示
 

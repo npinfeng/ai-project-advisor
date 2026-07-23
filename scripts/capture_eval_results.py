@@ -1,300 +1,207 @@
-"""Run evaluation cases through the running web server and capture real metrics.
+"""Capture real workflow observations without auto-labeling their quality.
 
-Usage (server must be running):
-    C:/miniconda/envs/agent/python.exe scripts/capture_eval_results.py
+The suite contains ground truth written before execution. This runner only fills
+observable fields (retrieved Evidence, generated citations, latency, tokens and
+cost), then produces a pending file for independent human annotation.
 """
 
+import argparse
 import asyncio
+import hashlib
 import json
+import os
 import re
-import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from typing import Any
 
 import httpx
 
-SERVER = "http://127.0.0.1:8000"
-URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]{}]+")
 
-TEST_CASES = [
-    {
-        "case_id": "frontend-framework-2025",
-        "question": (
-            "Compare React 19, Vue 3.5, Angular 19, Svelte 5, and SolidJS for a new frontend project. "
-            "Evaluate performance, ecosystem maturity, TypeScript support, and learning curve. "
-            "Team has prior React experience."
-        ),
-        "candidates": ["React", "Vue", "Angular", "Svelte", "SolidJS"],
-    },
-    {
-        "case_id": "database-choice-oltp",
-        "question": (
-            "Select a database for a high-concurrency OLTP system. Compare PostgreSQL 17, MySQL 9, "
-            "CockroachDB, and TiDB. Focus on transaction consistency, horizontal scaling, "
-            "operational complexity, and community support."
-        ),
-        "candidates": ["PostgreSQL", "MySQL", "CockroachDB", "TiDB"],
-    },
-    {
-        "case_id": "message-queue-async",
-        "question": (
-            "Select a message queue for asynchronous event processing. Compare Apache Kafka, "
-            "Redpanda, RabbitMQ, NATS, and Apache Pulsar. Evaluate delivery guarantees, "
-            "throughput, operational complexity, and ecosystem maturity."
-        ),
-        "candidates": ["Kafka", "Redpanda", "RabbitMQ", "NATS", "Pulsar"],
-    },
-    {
-        "case_id": "python-web-framework",
-        "question": (
-            "Choose a Python web framework for a new REST API service. Compare FastAPI, Litestar, "
-            "Flask 3.x, and Django 5. Evaluate async performance, type safety, plugin ecosystem, "
-            "and documentation quality."
-        ),
-        "candidates": ["FastAPI", "Litestar", "Flask", "Django"],
-    },
-    {
-        "case_id": "observability-stack",
-        "question": (
-            "Choose an observability stack for distributed services. Compare OpenTelemetry, "
-            "Grafana, Honeycomb, and Datadog APM. Evaluate tracing interoperability, metrics "
-            "and logs integration, self-hosting, and operational cost."
-        ),
-        "candidates": ["OpenTelemetry", "Grafana", "Honeycomb", "Datadog"],
-    },
-    {
-        "case_id": "container-orchestration",
-        "question": (
-            "Select container orchestration for an edge and private-cloud deployment. Compare "
-            "Kubernetes, Nomad, K3s, and Docker Swarm for reliability, resource overhead, "
-            "ecosystem support, and operating complexity."
-        ),
-        "candidates": ["Kubernetes", "Nomad", "K3s", "Docker Swarm"],
-    },
-    {
-        "case_id": "search-engine-selection",
-        "question": (
-            "Choose a search engine for product and log search. Compare Elasticsearch, "
-            "Meilisearch, Typesense, OpenSearch, and Quickwit for relevance, scale, "
-            "operational complexity, and self-hosting."
-        ),
-        "candidates": ["Elasticsearch", "Meilisearch", "Typesense", "OpenSearch", "Quickwit"],
-    },
-    {
-        "case_id": "graphql-vs-rest",
-        "question": (
-            "Choose an API style for a multi-client platform. Compare GraphQL with REST and "
-            "gRPC, including schema evolution, caching, observability, client complexity, "
-            "and server-side operational risks."
-        ),
-        "candidates": ["GraphQL", "REST", "gRPC"],
-    },
-    {
-        "case_id": "distributed-cache",
-        "question": (
-            "Select a distributed caching solution. Compare Redis 8, Dragonfly, Microsoft Garnet, "
-            "and Memcached. Evaluate throughput, clustering modes, persistence capabilities, "
-            "and operational tooling."
-        ),
-        "candidates": ["Redis", "Dragonfly", "Garnet", "Memcached"],
-    },
-    {
-        "case_id": "llm-orchestration-framework",
-        "question": (
-            "Choose an LLM agent orchestration framework. Compare LangGraph, CrewAI, "
-            "Microsoft AutoGen, DSPy, and Haystack 2.x. Evaluate workflow flexibility, "
-            "multi-agent collaboration, debugging observability, and community activity."
-        ),
-        "candidates": ["LangGraph", "CrewAI", "AutoGen", "DSPy", "Haystack"],
-    },
-]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SUITE = PROJECT_ROOT / "evals" / "golden_cases.json"
+URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]{}]+")
 
 
 def _extract_urls(text: str) -> list[str]:
-    urls = URL_PATTERN.findall(text)
-    return sorted({u.rstrip(".,;:!?，。；：！？\"'") for u in urls})
+    return sorted({
+        url.rstrip(".,;:!?，。；：！？\"'")
+        for url in URL_PATTERN.findall(text)
+    })
 
 
-def _extract_doc_ids(text: str) -> list[str]:
-    """Extract document identifiers from report text."""
-    ids: list[str] = []
-    heading_pattern = re.compile(r"^#{1,3}\s+(.+)$", re.MULTILINE)
-    ids.extend(h.strip() for h in heading_pattern.findall(text))
-    bold_pattern = re.compile(r"\*\*(.+?)\*\*")
-    ids.extend(b.strip() for b in bold_pattern.findall(text))
-    seen = set()
-    unique: list[str] = []
-    for did in ids:
-        if did.lower() not in seen and len(did) > 1:
-            seen.add(did.lower())
-            unique.append(did)
-    return unique[:30]
+def _load_suite(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    cases = payload.get("cases", [])
+    if not cases:
+        raise ValueError("评测套件至少需要一个 case。")
+    case_ids = [case.get("case_id") for case in cases]
+    if None in case_ids or len(case_ids) != len(set(case_ids)):
+        raise ValueError("评测套件 case_id 必须存在且唯一。")
+    for case in cases:
+        required = (
+            "question",
+            "candidates",
+            "relevant_documents",
+            "expected_citations",
+            "success_criteria",
+        )
+        missing = [key for key in required if not case.get(key)]
+        if missing:
+            raise ValueError(
+                f"{case['case_id']} 缺少预设字段：{', '.join(missing)}"
+            )
+    return payload
 
 
-async def run_one_case(
+async def _run_case(
     client: httpx.AsyncClient,
-    case: dict,
-    index: int,
-    total: int,
-) -> dict:
-    """Send one request to the SSE endpoint and capture the full result."""
-    print(f"\n[{index}/{total}] {case['case_id']}")
-    print(f"  Candidates: {case['candidates']}")
+    server: str,
+    case: dict[str, Any],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    final_report = ""
+    diagnostics: dict[str, Any] = {}
+    retrieved_evidences: list[dict[str, Any]] = []
+    run_error: str | None = None
 
     payload = {
         "question": case["question"],
         "candidates": case["candidates"],
         "allow_clarification": False,
+        "confirmed_candidates": True,
     }
-
-    started_at = time.perf_counter()
-    event_count = 0
-
     try:
         async with client.stream(
             "POST",
-            f"{SERVER}/api/advice/stream",
+            f"{server.rstrip('/')}/api/advice/stream",
             json=payload,
-            timeout=180.0,
+            timeout=timeout_seconds,
         ) as response:
-            final_report = ""
-            diagnostics = {}
-            current_event = None
-
+            response.raise_for_status()
+            current_event = "message"
             async for line in response.aiter_lines():
-                if not line:
-                    continue
-                if line.startswith("event: "):
-                    current_event = line[7:]
-                elif line.startswith("data: "):
-                    event_count += 1
-                    data = json.loads(line[6:])
-                    event_type = current_event or "unknown"
+                if line.startswith("event:"):
+                    current_event = line[6:].strip()
+                elif line.startswith("data:"):
+                    event_data = json.loads(line[5:].strip())
+                    if current_event == "result":
+                        final_report = event_data.get("report", "")
+                        diagnostics = event_data.get("diagnostics", {})
+                        retrieved_evidences = event_data.get(
+                            "retrieved_evidences", []
+                        )
+                    elif current_event == "error":
+                        run_error = event_data.get("message", "工作流返回错误")
+    except Exception as error:
+        run_error = f"{type(error).__name__}: {error}"
 
-                    if event_type == "result":
-                        final_report = data.get("report", "")
-                        diagnostics = data.get("diagnostics", {})
-                    elif event_type == "error":
-                        print(f"  ERROR event: {data.get('message', 'unknown')}")
-    except Exception as exc:
-        elapsed_ms = round((time.perf_counter() - started_at) * 1000)
-        print(f"  HTTP/stream error: {exc}")
-        return {
-            "case_id": case["case_id"],
-            "relevant_documents": [],
-            "retrieved_documents": [],
-            "expected_citations": [],
-            "generated_citations": [],
-            "supported_citations": [],
-            "task_success": False,
-            "latency_ms": elapsed_ms,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cost_usd": 0.0,
-        }
-
-    elapsed_ms = diagnostics.get("total_duration_ms", round((time.perf_counter() - started_at) * 1000))
+    elapsed_ms = diagnostics.get(
+        "total_duration_ms",
+        round((time.perf_counter() - started_at) * 1000),
+    )
     token_usage = diagnostics.get("token_usage", {})
-    input_tokens = token_usage.get("input_tokens", 0)
-    output_tokens = token_usage.get("output_tokens", 0)
-    cost = diagnostics.get("estimated_cost_usd", 0.0)
-
-    generated_citations = _extract_urls(final_report)
-    retrieved_docs = _extract_doc_ids(final_report)
-
-    print(f"  Events: {event_count} | Latency: {elapsed_ms}ms | Tokens: {input_tokens}+{output_tokens} | Cost: ${cost}")
+    retrieved_documents = list(dict.fromkeys(
+        str(item.get("source_url", ""))
+        for item in retrieved_evidences
+        if item.get("source_url")
+    ))
+    retrieved_evidence_ids = list(dict.fromkeys(
+        str(item.get("evidence_id", ""))
+        for item in retrieved_evidences
+        if item.get("evidence_id")
+    ))
 
     return {
         "case_id": case["case_id"],
-        "relevant_documents": retrieved_docs.copy(),
-        "retrieved_documents": retrieved_docs.copy(),
-        "expected_citations": generated_citations.copy(),
-        "generated_citations": generated_citations.copy(),
-        "supported_citations": generated_citations.copy(),
-        "task_success": bool(final_report),
+        "relevant_documents": case["relevant_documents"],
+        "retrieved_documents": retrieved_documents,
+        "retrieved_evidence_ids": retrieved_evidence_ids,
+        "expected_citations": case["expected_citations"],
+        "generated_citations": _extract_urls(final_report),
+        "supported_citations": [],
+        "task_success": None,
         "latency_ms": elapsed_ms,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cost_usd": cost,
+        "input_tokens": int(token_usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(token_usage.get("output_tokens", 0) or 0),
+        "cost_usd": float(diagnostics.get("estimated_cost_usd", 0) or 0),
+        "annotation_context": {
+            "success_criteria": case["success_criteria"],
+            "run_error": run_error,
+            "report_preview": final_report[:1500],
+        },
     }
 
 
-async def main():
-    print("=" * 60)
-    print("Project Advisor — Real Evaluation Data Capture")
-    print(f"Server: {SERVER}")
-    print(f"Cases: {len(TEST_CASES)}")
-    print("=" * 60)
-
-    total = len(TEST_CASES)
+async def _capture(args: argparse.Namespace) -> Path:
+    suite = _load_suite(args.suite)
+    suite_bytes = args.suite.read_bytes()
+    created_at = datetime.now(timezone.utc)
+    run_id = created_at.strftime("run-%Y%m%dT%H%M%SZ")
     results = []
 
     async with httpx.AsyncClient() as client:
-        for i, case in enumerate(TEST_CASES, 1):
-            result = await run_one_case(client, case, i, total)
+        for index, case in enumerate(suite["cases"], start=1):
+            print(f"[{index}/{len(suite['cases'])}] {case['case_id']}")
+            result = await _run_case(
+                client, args.server, case, args.timeout_seconds
+            )
             results.append(result)
-            if i < total:
-                print("  Waiting 3s before next case...")
-                await asyncio.sleep(3)
-
-    # Clean output — remove annotation fields (auto-populated, need human review)
-    clean_results = []
-    for r in results:
-        clean_results.append({
-            "case_id": r["case_id"],
-            "relevant_documents": [],
-            "retrieved_documents": r["retrieved_documents"],
-            "expected_citations": [],
-            "generated_citations": r["generated_citations"],
-            "supported_citations": [],
-            "task_success": None,
-            "latency_ms": r["latency_ms"],
-            "input_tokens": r["input_tokens"],
-            "output_tokens": r["output_tokens"],
-            "cost_usd": r["cost_usd"],
-        })
+            if args.delay_seconds and index < len(suite["cases"]):
+                await asyncio.sleep(args.delay_seconds)
 
     output = {
-        "k": 5,
-        "_metadata": {
-            "description": (
-                "Real LangGraph workflow execution results via SSE API. "
-                "Automated fields (latency, tokens, cost, retrieved_documents, generated_citations) "
-                "are from actual runs. Annotation fields (relevant_documents, expected_citations, "
-                "supported_citations, task_success) are empty and REQUIRE HUMAN REVIEW."
+        "k": int(suite.get("k", 5)),
+        "metadata": {
+            "dataset_name": run_id,
+            "display_name": f"真实运行 {run_id}（待审核）",
+            "dataset_kind": "real_run",
+            "annotation_status": "pending",
+            "annotation_method": "none",
+            "annotator": None,
+            "is_publishable": False,
+            "run_id": run_id,
+            "model": os.getenv("RESEARCH_MODEL", "not-recorded"),
+            "created_at": created_at.isoformat(),
+            "notes": (
+                f"suite={suite.get('suite_name', args.suite.name)}; "
+                f"suite_sha256={hashlib.sha256(suite_bytes).hexdigest()}; "
+                "supported_citations 和 task_success 必须独立人工审核。"
             ),
-            "model": "deepseek:deepseek-chat",
-            "total_runs": len(clean_results),
         },
-        "cases": clean_results,
+        "cases": results,
     }
 
-    output_path = Path(__file__).resolve().parents[1] / "evals" / "real_run_results.json"
-    output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output_path = args.output or (
+        PROJECT_ROOT / "evals" / "runs" / f"{run_id}.pending.json"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return output_path
 
-    print(f"\n{'=' * 60}")
-    print(f"Results written to: {output_path}")
-    print(f"{'=' * 60}")
 
-    successes = sum(1 for r in results if r["task_success"])
-    costs = [r["cost_usd"] for r in results]
-    tokens = [r["input_tokens"] + r["output_tokens"] for r in results]
-    latencies = [r["latency_ms"] for r in results]
-
-    print(f"\nSummary:")
-    print(f"  Case count: {len(results)}")
-    print(f"  Success: {successes}/{len(results)}")
-    print(f"  Latency: {min(latencies)/1000:.1f}s — {max(latencies)/1000:.1f}s")
-    print(f"  Avg tokens: {sum(tokens)/len(tokens):.0f}")
-    print(f"  Total cost: ${sum(costs):.4f}")
-    print(f"\n⚠️  NEXT STEP: Open evals/real_run_results.json and manually fill in:")
-    print(f"    - relevant_documents: which retrieved docs are actually relevant")
-    print(f"    - expected_citations: which citations should have appeared")
-    print(f"    - supported_citations: which generated citations have real evidence")
-    print(f"    - task_success: true/false for each case")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Capture real Project Advisor observations for later review."
+    )
+    parser.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
+    parser.add_argument("--server", default="http://127.0.0.1:8000")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--delay-seconds", type=float, default=1.0)
+    args = parser.parse_args()
+    output_path = asyncio.run(_capture(args))
+    print(f"待审核运行结果：{output_path}")
+    print(
+        "下一步：运行 scripts/annotate_eval_results.py，"
+        "不要直接将 pending 文件接入正式看板。"
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
