@@ -1,10 +1,11 @@
 # AI Project Advisor
 
-一个面向技术团队的开源项目选型系统。它使用 LangGraph 编排多个 Agent，联合 GitHub、Web、Hybrid RAG 与 MCP 工具收集证据，最终输出七维评分、风险说明、引用来源和可观测的运行诊断。
+一个面向技术团队的开源项目选型系统。它采用“薄 Multi-Agent、厚 Workflow”架构：两个专业 Research Agent 负责取证，一个无工具 Reviewer 负责结构化判断，其余调度、缺口检查、评分和报告均由确定性节点完成。
 
 ## 核心能力
 
-- 多 Agent 工作流：Planner、Repository Analyst、Documentation Researcher、Reviewer 分工协作。
+- 专业化 Agent：Repository Analyst 和 Documentation Researcher 使用相互隔离的工具集。
+- 受限 Reviewer：只能读取规范化 Evidence，不具备工具权限，也不能决定权重和最终排名。
 - 证据驱动：统一 `Evidence` 模型记录来源、时间、版本、置信度与评估维度。
 - 确定性评分：LLM 负责分析证据，程序按配置权重计算最终分数和排名。
 - Hybrid RAG：BM25、向量检索、RRF 融合、查询改写和 Reranker。
@@ -19,21 +20,28 @@
 用户需求
   │
   ▼
-Planner ──► Supervisor
-               ├──► Repository Analyst ──► GitHub / RAG / MCP
-               └──► Documentation Researcher ──► Web / Docs / RAG / MCP
-                              │
-                              ▼
-                    Reviewer（结构化输出）
-                              │
-                              ▼
-                  程序化加权评分 + Markdown 报告
+已确认的结构化计划
+          │
+          ▼
+确定性任务展开与强类型路由
+     ├──► Repository Analyst ──► GitHub + 仓库 MCP 白名单
+     └──► Documentation Researcher ──► Web + 只读 RAG + 文档 MCP 白名单
+          │
+          ▼
+ Evidence 去重、持久化与覆盖检查
+     └──► 明确缺口时最多补充一次
+          │
+          ▼
+      无工具 Reviewer（结构化输出）
+          │
+          ▼
+程序化证据绑定、加权排名 + Markdown 模板
                               │
                               ▼
                  FastAPI / SSE / 运行诊断面板
 ```
 
-工作流对研究迭代次数和工具调用次数设有上限。MCP 连接失败默认降级，设置 `MCP_REQUIRED=true` 后则中断任务。
+候选预览可以使用一次结构化模型调用，但不进入运行期 Agent 循环。执行阶段直接复用已确认计划；手动候选模式则由程序生成固定七维计划。每个研究员仍有工具调用上限，补充研究固定最多一轮。
 
 ## 快速开始
 
@@ -80,6 +88,8 @@ C:\miniconda\envs\agent\python.exe -m uvicorn project_advisor.app:app --host 127
 ENABLE_LOCAL_MCP=true
 MCP_REQUIRED=false
 MCP_CONNECT_TIMEOUT_SECONDS=20
+REPOSITORY_MCP_TOOL_ALLOWLIST=
+DOCUMENTATION_MCP_TOOL_ALLOWLIST=
 MCP_SERVERS_JSON=
 ```
 
@@ -95,7 +105,7 @@ MCP_SERVERS_JSON={"docs":{"transport":"stdio","command":"npx","args":["-y","@mod
 MCP_SERVERS_JSON={"company":{"transport":"streamable_http","url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer replace-me"}}}
 ```
 
-生产环境应通过密钥管理服务注入认证信息，不要提交真实令牌。浏览器请求不能传入 MCP 命令，外部 Server 只能由服务端环境变量配置。
+Research Agent 不再接收全部 MCP 工具。只有工具名出现在对应角色的逗号分隔白名单中才会注入；未分类工具默认拒绝。生产环境应通过密钥管理服务注入认证信息，不要提交真实令牌。浏览器请求不能传入 MCP 命令，外部 Server 只能由服务端环境变量配置。
 
 ## 持久化知识库
 
@@ -114,7 +124,7 @@ MCP_SERVERS_JSON={"company":{"transport":"streamable_http","url":"https://mcp.ex
 
 每个 SSE `progress` 事件包含当前阶段耗时，最终 `result` 事件包含：
 
-- 总耗时与五个工作流阶段耗时；
+- 总耗时与七个工作流阶段耗时（未触发的补充研究显示为跳过）；
 - 候选项目数量和报告中唯一引用 URL 数；
 - MCP 的连接状态、Server 数量和工具数量；
 - 模型返回的输入、输出与总 Token；
@@ -202,7 +212,7 @@ C:\miniconda\envs\agent\python.exe -m pytest tests -v -p no:cacheprovider
 ```
 
 MCP 集成测试会实际启动内置 stdio Server、发现工具并调用 `estimate_llm_cost`，不是 Mock 测试。
-当前完整回归结果为 `29 passed`。测试覆盖 Evidence 重启恢复、BM25/Chroma 持久化、重复入库幂等性、SSE 真实 Evidence 采集、待审核门禁、独立人工标注和循环标签防护。
+当前完整回归结果为 `32 passed`。测试覆盖专业化工具隔离、确定性任务展开、单次补充研究门禁、无模型报告渲染、Evidence 重启恢复、BM25/Chroma 持久化、SSE 真实 Evidence 采集和可信评测闭环。
 
 ## 故障降级演示
 

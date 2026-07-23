@@ -76,9 +76,11 @@ class CandidateSuggestionRequest(BaseModel):
 NODE_LABELS = {
     "clarify_requirements": "需求解析",
     "plan_evaluation": "生成评估计划",
-    "research_supervisor": "并行证据研究",
+    "parallel_research": "专业化并行研究",
+    "evidence_coverage": "确定性证据检查",
+    "supplemental_research": "受限补充研究",
     "review_and_score": "证据审查与评分",
-    "generate_report": "生成最终报告",
+    "generate_report": "确定性报告生成",
 }
 
 
@@ -307,7 +309,9 @@ async def _stream_graph(
 
                 now = time.perf_counter()
                 stage_duration_ms = round((now - stage_started_at) * 1000)
-                stage_durations_ms[node_name] = stage_duration_ms
+                stage_durations_ms[node_name] = (
+                    stage_durations_ms.get(node_name, 0) + stage_duration_ms
+                )
                 stage_started_at = now
 
                 yield _sse_event(
@@ -317,6 +321,7 @@ async def _stream_graph(
                         "label": NODE_LABELS[node_name],
                         "status": "completed",
                         "stage_duration_ms": stage_duration_ms,
+                        "next": output.get("next"),
                         "scores": scores if node_name == "review_and_score" else [],
                     },
                 )

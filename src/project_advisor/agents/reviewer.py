@@ -10,11 +10,11 @@ Reviewer 是技术选型流程的最后一个核心 Agent，负责：
 
 import json
 
-from langchain_core.messages import HumanMessage, SystemMessage, get_buffer_string
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from project_advisor.configuration import Configuration
-from project_advisor.prompts import final_report_template, reviewer_system_prompt
+from project_advisor.prompts import reviewer_system_prompt
 from project_advisor.schemas.evidence import Evidence, ProjectScore, ReviewResult
 from project_advisor.state import AgentState
 from project_advisor.tools.citations import detect_conflicts
@@ -23,7 +23,11 @@ from project_advisor.tools.scoring import (
     create_criteria_from_config,
     format_score_table,
 )
-from project_advisor.utils import create_chat_model, get_today_str
+from project_advisor.utils import (
+    create_chat_model,
+    get_message_token_usage,
+    get_today_str,
+)
 
 
 def _normalize_evidences(values: list) -> list[Evidence]:
@@ -98,31 +102,32 @@ def _bind_scores_to_evidence(
 
 
 async def review_and_score(state: AgentState, config: RunnableConfig):
-    """汇总研究发现并对候选项目进行评分。
-
-    此节点：
-    1. 汇总 Supervisor 收集的所有研究笔记
-    2. 使用 Reviewer LLM 对每个项目进行多维度评分
-    3. 计算加权总分并排序
-    """
-    notes = state.get("notes", [])
-    findings = "\n\n".join(notes) if notes else "暂无研究发现。"
+    """Run one tool-less structured review over canonical Evidence only."""
     candidates = state.get("candidates", [])
     research_brief = state.get("research_brief", "")
     evidences = _normalize_evidences(state.get("evidences", []))
     evidence_payload = [
         {
             **evidence.model_dump(exclude={"content"}),
-            "content": evidence.content[:1800],
+            "content": evidence.content[:1000],
         }
-        for evidence in evidences[:80]
+        for evidence in evidences[:60]
     ]
+    workflow_gaps = []
+    for value in state.get("evidence_gaps", []):
+        if hasattr(value, "model_dump"):
+            value = value.model_dump()
+        if isinstance(value, dict):
+            workflow_gaps.append(
+                f"{value.get('project_name', '未知项目')}/"
+                f"{value.get('track', 'unknown')}: {value.get('reason', '')}"
+            )
 
     configurable = Configuration.from_runnable_config(config)
 
     # 使用 Reviewer 模型进行评分分析
     reviewer_prompt = reviewer_system_prompt.format(date=get_today_str())
-    review_prompt = f"""基于以下研究简报和发现，分析每个候选项目并给出评分建议。
+    review_prompt = f"""基于以下研究简报和结构化证据，分析每个候选项目并给出评分建议。
 
 <研究简报>
 {research_brief}
@@ -132,13 +137,13 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
 {', '.join(candidates) if candidates else '待确定'}
 </候选项目>
 
-<研究发现>
-{findings}
-</研究发现>
-
 <结构化证据>
 {json.dumps(evidence_payload, ensure_ascii=False, indent=2) if evidence_payload else '暂无结构化证据'}
 </结构化证据>
+
+<工作流检测到的证据缺口>
+{json.dumps(workflow_gaps, ensure_ascii=False) if workflow_gaps else '无'}
+</工作流检测到的证据缺口>
 
 请对每个候选项目分析其优势、劣势和风险。提供评分建议（1-10 分/每维度）。
 评分只能依据上面的结构化证据，不得编造 evidence_id 或来源 URL。
@@ -172,130 +177,105 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
         response.scores, candidates, evidences
     )
     ranked_scores = compare_projects(bound_scores, criteria)
-    score_table = format_score_table(ranked_scores)
-    all_gaps = list(dict.fromkeys([*response.evidence_gaps, *binding_gaps]))
-    evidence_gaps = "\n".join(f"- {gap}" for gap in all_gaps)
-    review_note = f"=== Reviewer 分析 ===\n{response.analysis}\n\n{score_table}"
-    if evidence_gaps:
-        review_note += f"\n\n=== 证据缺口 ===\n{evidence_gaps}"
+    all_gaps = list(dict.fromkeys([
+        *workflow_gaps,
+        *response.evidence_gaps,
+        *binding_gaps,
+    ]))
 
     return {
         "evaluation_criteria": criteria,
         "scores": ranked_scores,
-        "notes": [review_note],
+        "review_analysis": response.analysis,
+        "review_evidence_gaps": all_gaps,
+        "token_usage": get_message_token_usage(response),
         "next": "generate_report",
     }
 
 
 async def generate_report(state: AgentState, config: RunnableConfig):
-    """生成最终技术选型报告。
-
-    使用 Reviewer 分析结果 + 所有研究发现，
-    按照技术选型报告模板生成结构化的 Markdown 报告。
-    """
-    configurable = Configuration.from_runnable_config(config)
-    notes = state.get("notes", [])
-    findings = "\n\n".join(notes) if notes else "暂无研究发现。"
+    """Render the reviewed state as Markdown without another model call."""
     candidates = state.get("candidates", [])
     research_brief = state.get("research_brief", "")
     scores = state.get("scores", [])
     evidences = _normalize_evidences(state.get("evidences", []))
     score_table = format_score_table(scores) if scores else "暂无结构化评分。"
-    findings = f"{findings}\n\n=== 程序计算的结构化评分 ===\n{score_table}"
-
-    # 从笔记数据构建候选项目信息
-    candidates_data = _extract_candidates_from_notes(notes, candidates)
-
-    report_model = create_chat_model(
-        configurable.final_report_model,
-        max_tokens=configurable.final_report_model_max_tokens,
+    analysis = state.get("review_analysis", "暂无 Reviewer 分析。")
+    gaps = state.get("review_evidence_gaps", [])
+    eligible_scores = [
+        score
+        for score in scores
+        if score.evidence_confidence != "insufficient"
+    ]
+    winner = (
+        eligible_scores[0].project_name
+        if eligible_scores
+        else "证据不足，暂不推荐"
     )
+    sections = [
+        "# 技术选型评估报告",
+        "## 1. 需求与范围",
+        research_brief or "未提供研究简报。",
+        "## 2. 候选项目",
+        "\n".join(f"- {candidate}" for candidate in candidates) or "- 未确定",
+        "## 3. Reviewer 分析",
+        analysis,
+        "## 4. 程序化加权评分",
+        score_table,
+        "## 5. 推荐结果",
+        f"- **当前首选**：{winner}",
+        "- 排名由配置权重确定性计算；Reviewer 只提供结构化维度分。",
+    ]
 
-    # 构建报告参数
-    if candidates:
-        candidate_names = " | ".join(candidates)
-        separator = "|".join(["---------"] * (len(candidates) + 1))
+    score_map = {score.project_name.casefold(): score for score in scores}
+    details = []
+    for candidate in candidates:
+        score = score_map.get(candidate.casefold())
+        if score is None:
+            details.append(f"### {candidate}\n- 缺少结构化评分。")
+            continue
+        details.append(
+            f"### {candidate}\n"
+            f"- 功能匹配度：{score.feature_match}/10\n"
+            f"- 工程可靠性：{score.engineering_reliability}/10\n"
+            f"- 社区与维护：{score.community_and_maintenance}/10\n"
+            f"- 文档质量：{score.documentation_quality}/10\n"
+            f"- 学习成本：{score.learning_cost}/10\n"
+            f"- 扩展能力：{score.extensibility}/10\n"
+            f"- 部署成本：{score.deployment_cost}/10\n"
+            f"- **加权总分：{score.weighted_total}/10**\n"
+            f"- 证据置信度：{score.evidence_confidence}\n"
+            f"- 评分依据：{score.justification}\n"
+            f"- 证据 ID：{', '.join(score.evidence_ids) or '无'}"
+        )
+    sections.extend(["## 6. 候选项目详情", "\n\n".join(details) or "暂无详情。"])
+    sections.extend([
+        "## 7. 证据缺口",
+        "\n".join(f"- {gap}" for gap in gaps) or "- 未检测到明确缺口。",
+    ])
 
-        score_map = {score.project_name.lower(): score for score in scores}
-        project_sections = []
-        for name in candidates:
-            score = score_map.get(name.lower())
-            if score:
-                project_sections.append(
-                    f"### 5.{candidates.index(name) + 1} {name}\n"
-                    f"- **功能匹配度**：{score.feature_match}/10\n"
-                    f"- **工程可靠性**：{score.engineering_reliability}/10\n"
-                    f"- **社区与维护状态**：{score.community_and_maintenance}/10\n"
-                    f"- **文档与示例质量**：{score.documentation_quality}/10\n"
-                    f"- **学习成本**：{score.learning_cost}/10\n"
-                    f"- **扩展能力**：{score.extensibility}/10\n"
-                    f"- **部署和运行成本**：{score.deployment_cost}/10\n"
-                    f"- **加权总分**：{score.weighted_total}/10\n"
-                    f"- **证据置信度**：{score.evidence_confidence}\n"
-                    f"- **证据 ID**：{', '.join(score.evidence_ids) or '无'}\n"
-                    f"- **来源 URL**：{', '.join(score.source_urls) or '无'}\n"
-                    f"- **评分依据**：{score.justification}\n"
-                )
-            else:
-                project_sections.append(
-                    f"### 5.{candidates.index(name) + 1} {name}\n"
-                    "该项目缺少足够证据，暂未生成结构化评分。\n"
-                )
-    else:
-        candidate_names = "项目A | 项目B | 项目C"
-        separator = "|---------|---------|---------|"
-        project_sections = ["（待确定候选项目）"]
-
-    project_sections_str = "\n".join(project_sections) if isinstance(project_sections, list) else project_sections
-
-    report_prompt = final_report_template.format(
-        research_brief=research_brief,
-        findings=findings,
-        candidates_data=candidates_data,
-        candidate_names=candidate_names,
-        separator=separator,
-        project_sections=project_sections_str,
-    )
-
-    try:
-        final_report = await report_model.ainvoke([
-            HumanMessage(content=report_prompt),
-        ])
-        report_content = str(final_report.content)
-    except Exception as e:
-        report_content = f"报告生成失败：{str(e)}\n\n=== 原始研究发现 ===\n\n{findings}"
-
-    # 检查冲突
     if evidences:
         conflicts = detect_conflicts(evidences)
         if conflicts:
             conflict_text = "\n".join([
                 f"- **{c['type']}**：{c.get('detail', '')}" for c in conflicts
             ])
-            report_content += f"\n\n## 12. 来源冲突检测\n\n{conflict_text}"
+        else:
+            conflict_text = "- 未检测到来源冲突。"
+        sections.extend(["## 8. 来源冲突检测", conflict_text])
+
+    source_lines = [
+        f"- `{evidence.evidence_id}` [{evidence.project_name}] "
+        f"{evidence.source_url}（{evidence.source_type}，{evidence.retrieved_at}）"
+        for evidence in evidences
+    ]
+    sections.extend([
+        "## 9. 信息来源",
+        "\n".join(source_lines) or "- 没有可追溯来源。",
+    ])
+    report_content = "\n\n".join(sections)
 
     return {
         "final_report": report_content,
         "messages": [SystemMessage(content=report_content)],
     }
-
-
-def _extract_candidates_from_notes(notes: list[str], candidates: list[str]) -> str:
-    """从研究笔记中提取候选项目相关数据。"""
-    if not notes:
-        return "暂无候选项目数据。"
-
-    relevant = []
-    for note in notes:
-        for candidate in candidates:
-            if candidate.lower() in note.lower():
-                # 截取相关片段
-                idx = note.lower().find(candidate.lower())
-                start = max(0, idx - 100)
-                end = min(len(note), idx + 500)
-                relevant.append(f"[关于 {candidate}] ...{note[start:end]}...")
-                break
-
-    if relevant:
-        return "\n\n".join(relevant)
-    return "\n\n".join(notes[:3])  # 如果找不到匹配，返回前几条笔记

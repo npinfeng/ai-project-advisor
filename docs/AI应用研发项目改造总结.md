@@ -4,6 +4,8 @@
 
 本文档汇总 `AI Project Advisor` 为面向 **AI 应用研发工程师面试** 所做的改造，说明项目当前具备的能力、关键技术实现、可用于面试表达的亮点，以及仍未完成或尚未验证的部分。
 
+> 2026-07-23 架构更新：项目已经从 Supervisor 驱动的多 Agent 循环重构为“两个专业 Research Agent + 一个受限 Reviewer + 确定性工作流”。下文若提到旧 Supervisor 或 `get_all_tools()` 全量注入，均以本更新和 README 的当前架构为准。
+
 项目定位已经从“调用大模型生成技术选型建议的 Demo”，升级为一个具备以下要素的 AI 应用工程项目：
 
 - 基于 LangGraph 的多 Agent 工作流
@@ -24,25 +26,26 @@
 用户需求
   → 需求澄清
   → 评估计划
-  → Supervisor 分派研究任务
+  → 确定性展开 repository / documentation 强类型任务
   → Repository Analyst / Documentation Researcher 并行研究
-  → Reviewer 结构化评分
-  → 最终 Markdown 报告
+  → Evidence 覆盖检查；明确缺口时最多补充一次
+  → 无工具 Reviewer 结构化评分
+  → 程序化加权排名和 Markdown 模板报告
 ```
 
 ## 3. 已完成的核心改造
 
-### 3.1 修通 LangGraph 多 Agent 工作流
+### 3.1 薄 Multi-Agent、厚 Workflow
 
-对原有工作流进行了拓扑和状态流转修复，确保 Supervisor 和 Researcher 子图可以形成真实的 Agent 工具调用循环，而不是仅按固定顺序执行节点。
+运行期只保留两个有工具循环的专业 Research Agent 和一个无工具 Reviewer。Planner 的确认结果由程序展开为强类型任务，不再调用 Supervisor 模型重复规划。
 
 主要改造包括：
 
-- Supervisor 可以根据研究任务持续分派 Researcher。
-- Repository Analyst 和 Documentation Researcher 可以调用工具后返回 Agent 继续判断。
-- 研究达到终止条件后进入压缩和汇总节点。
-- 修复 `ResearchComplete` 被当作普通工具执行的问题。
-- 保留最大研究迭代次数和最大工具调用次数，避免工作流无限循环。
+- Repository Analyst 只能使用 GitHub 工具及显式允许的 MCP 工具。
+- Documentation Researcher 只能使用 Web、只读 RAG 及显式允许的 MCP 工具。
+- Evidence 合并、去重、持久化和覆盖检查由确定性节点执行。
+- 明确证据缺口只允许触发一次补充研究，不存在开放式 Supervisor 循环。
+- 研究摘要和最终 Markdown 报告不再额外调用模型。
 
 相关文件：
 
@@ -162,7 +165,7 @@ SSE 事件包括：
 - 输入候选项目。
 - 一键填充 Agent 框架、RAG、LLM 可观测性示例。
 - 实时显示字符数。
-- 实时展示五个工作流阶段。
+- 实时展示七个工作流阶段，并标识未触发的补充研究。
 - 显示候选项目加权得分和进度条。
 - 渲染 Markdown 标题、列表和表格。
 - 复制最终报告。
@@ -244,7 +247,7 @@ project-advisor-eval  运行离线评测
 
 ### 4.3 MCP 动态注册
 
-当前 `get_all_tools()` 已加入 MCP 工具加载逻辑。Researcher 获取工具列表时，会将 MCP Tool 与 GitHub、搜索、RAG 工具合并。因此 MCP 已进入 Agent 可选择、可调用的真实工具链路。
+当前使用 `get_repository_tools()` 和 `get_documentation_tools()` 分别装配权限。MCP 工具只有出现在对应角色白名单时才会注入，未分类工具默认拒绝；`get_all_tools()` 仅保留为兼容性工具清单，不供 Research Agent 使用。
 
 相关文件：
 
@@ -373,7 +376,8 @@ Python 3.11.15
 已覆盖的主要内容包括：
 
 - Graph 编译。
-- Supervisor 和 Researcher 子图循环。
+- 确定性任务展开、Evidence 覆盖检查和最多一次补充研究。
+- 两个 Researcher 子图的专业化工具循环。
 - Pydantic Schema。
 - 七维评分引擎。
 - 引用与冲突检测。
@@ -392,7 +396,7 @@ Python 3.11.15
 - MCP Tool 实际调用。
 - 离线评测公式。
 - 示例评测文件加载。
-- MCP 工具加入 `get_all_tools()` 后的完整回归测试。
+- MCP 角色白名单和 Research Agent 工具隔离的完整回归测试。
 
 因此不能把此前的 `12 passed` 当作当前最新代码的最终测试结论。
 
@@ -442,7 +446,7 @@ C:\miniconda\envs\agent\python.exe -m uvicorn project_advisor.app:app --host 127
 
 ```text
 Researcher
-  → get_all_tools
+  → 角色专用工具工厂与 MCP 白名单
   → MultiServerMCPClient
   → stdio 启动 FastMCP Server
   → tools/list 获取工具描述

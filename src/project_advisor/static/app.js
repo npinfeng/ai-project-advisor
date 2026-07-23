@@ -37,7 +37,9 @@ const evaluationMeta = document.querySelector("#evaluationMeta");
 const stageOrder = [
   "clarify_requirements",
   "plan_evaluation",
-  "research_supervisor",
+  "parallel_research",
+  "evidence_coverage",
+  "supplemental_research",
   "review_and_score",
   "generate_report",
 ];
@@ -170,9 +172,9 @@ function formatDuration(milliseconds) {
   return `${minutes}m ${seconds}s`;
 }
 
-function activateStage(nodeName, durationMs) {
+function activateStage(nodeName, durationMs, routedNext) {
   const index = stageOrder.indexOf(nodeName);
-  const nextNode = stageOrder[index + 1];
+  const nextNode = routedNext || stageOrder[index + 1];
   const item = document.querySelector(`[data-node="${nodeName}"]`);
   if (item) {
     item.classList.remove("active");
@@ -180,9 +182,17 @@ function activateStage(nodeName, durationMs) {
     item.querySelector(".timeline-state").textContent = `完成 · ${formatDuration(durationMs)}`;
   }
   if (nextNode) {
+    document.querySelectorAll("#timeline li.active").forEach((activeItem) => {
+      activeItem.classList.remove("active");
+      if (!activeItem.classList.contains("completed")) {
+        activeItem.querySelector(".timeline-state").textContent = "已跳过";
+      }
+    });
     const nextItem = document.querySelector(`[data-node="${nextNode}"]`);
-    nextItem.classList.add("active");
-    nextItem.querySelector(".timeline-state").textContent = "执行中";
+    if (nextItem) {
+      nextItem.classList.add("active");
+      nextItem.querySelector(".timeline-state").textContent = "执行中";
+    }
   }
 }
 
@@ -368,7 +378,7 @@ function handleEvent(eventName, data) {
     first.querySelector(".timeline-state").textContent = "执行中";
   }
   if (eventName === "progress") {
-    activateStage(data.node, data.stage_duration_ms);
+    activateStage(data.node, data.stage_duration_ms, data.next);
     if (data.scores?.length) renderScores(data.scores);
   }
   if (eventName === "result") {

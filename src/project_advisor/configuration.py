@@ -38,10 +38,6 @@ class Configuration(BaseModel):
     )
 
     # ===== 研究迭代配置 =====
-    max_researcher_iterations: int = Field(
-        default=6,
-        description="研究主管最大迭代次数",
-    )
     max_react_tool_calls: int = Field(
         default=10,
         description="单个研究员最大工具调用次数",
@@ -56,17 +52,9 @@ class Configuration(BaseModel):
         default=10000,
         description="研究模型最大输出 token 数",
     )
-    compression_model: str = Field(
-        default="deepseek:deepseek-chat",
-        description="压缩模型（汇总研究发现）",
-    )
-    compression_model_max_tokens: int = Field(
-        default=8192,
-        description="压缩模型最大输出 token 数",
-    )
     final_report_model: str = Field(
         default="deepseek:deepseek-chat",
-        description="最终报告模型",
+        description="受限 Reviewer 使用的结构化输出模型",
     )
     final_report_model_max_tokens: int = Field(
         default=10000,
@@ -96,6 +84,14 @@ class Configuration(BaseModel):
         default=20.0,
         gt=0,
         description="MCP 工具发现超时时间（秒）",
+    )
+    repository_mcp_tool_allowlist: str = Field(
+        default="",
+        description="Repository Agent 可使用的 MCP 工具名，逗号分隔；默认全部拒绝",
+    )
+    documentation_mcp_tool_allowlist: str = Field(
+        default="",
+        description="Documentation Agent 可使用的 MCP 工具名，逗号分隔；默认全部拒绝",
     )
 
     # ===== 运行诊断配置 =====

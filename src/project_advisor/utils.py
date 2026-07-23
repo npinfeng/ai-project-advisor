@@ -4,7 +4,7 @@ import os
 import logging
 import asyncio
 from datetime import datetime
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Literal, Mapping, Optional
 
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
@@ -14,7 +14,6 @@ from langchain_core.tools import InjectedToolArg, tool
 from tavily import AsyncTavilyClient
 
 from project_advisor.configuration import Configuration, SearchAPI
-from project_advisor.prompts import clarify_with_user_instructions
 
 
 # ===== 日期工具 =====
@@ -83,6 +82,25 @@ def create_chat_model(
         raise ValueError(
             f"不支持的模型提供商：'{provider}'，当前支持：deepseek, openai, anthropic"
         )
+
+
+def get_message_token_usage(message: Any) -> dict[str, int]:
+    """Extract provider-neutral token counters from one model response."""
+    usage = getattr(message, "usage_metadata", None)
+    if not isinstance(usage, Mapping):
+        response_metadata = getattr(message, "response_metadata", None)
+        if isinstance(response_metadata, Mapping):
+            usage = response_metadata.get("token_usage") or response_metadata.get("usage")
+    if not isinstance(usage, Mapping):
+        return {"input_tokens": 0, "output_tokens": 0}
+    return {
+        "input_tokens": int(
+            usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+        ),
+        "output_tokens": int(
+            usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+        ),
+    }
 
 
 def get_tavily_api_key() -> Optional[str]:
@@ -201,9 +219,33 @@ async def get_search_tool(search_api: SearchAPI):
     return []
 
 
-async def get_all_tools(config: RunnableConfig):
-    """组装完整的工具体系（搜索 + GitHub + RAG + MCP + 研究控制）。"""
+def _tool_name(value: Any) -> str:
+    return str(getattr(value, "name", getattr(value, "__name__", "")))
+
+
+async def _get_allowlisted_mcp_tools(
+    configurable: Configuration,
+    allowlist_value: str,
+) -> list[Any]:
+    """Deny unclassified MCP tools and expose only explicitly named tools."""
     from project_advisor.mcp_client import get_mcp_tools
+
+    allowlist = {
+        name.strip()
+        for name in allowlist_value.split(",")
+        if name.strip()
+    }
+    if not allowlist:
+        return []
+    return [
+        value
+        for value in await get_mcp_tools(configurable)
+        if _tool_name(value) in allowlist
+    ]
+
+
+async def get_repository_tools(config: RunnableConfig) -> list[Any]:
+    """Return the least-privilege tool set for repository engineering research."""
     from project_advisor.state import ResearchComplete
     from project_advisor.tools.github import (
         github_get_readme,
@@ -211,17 +253,6 @@ async def get_all_tools(config: RunnableConfig):
         github_list_issues,
         github_list_releases,
     )
-    from project_advisor.tools.document_collector import (
-        batch_fetch_tool,
-        web_fetch_tool,
-    )
-    from project_advisor.tools.rag_search import (
-        rag_ingest,
-        rag_rebuild,
-        rag_search,
-        rag_status,
-    )
-
     tools = [
         think_tool,
         ResearchComplete,
@@ -229,21 +260,53 @@ async def get_all_tools(config: RunnableConfig):
         github_list_releases,
         github_list_issues,
         github_get_readme,
+    ]
+    configurable = Configuration.from_runnable_config(config)
+    tools.extend(await _get_allowlisted_mcp_tools(
+        configurable,
+        configurable.repository_mcp_tool_allowlist,
+    ))
+    return tools
+
+
+async def get_documentation_tools(config: RunnableConfig) -> list[Any]:
+    """Return search/fetch/read-only-RAG tools for documentation research."""
+    from project_advisor.state import ResearchComplete
+    from project_advisor.tools.document_collector import (
+        batch_fetch_tool,
+        web_fetch_tool,
+    )
+    from project_advisor.tools.rag_search import rag_search
+
+    tools = [
+        think_tool,
+        ResearchComplete,
         web_fetch_tool,
         batch_fetch_tool,
         rag_search,
-        rag_ingest,
-        rag_rebuild,
-        rag_status,
     ]
-
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))
-    search_tools = await get_search_tool(search_api)
-    tools.extend(search_tools)
-    tools.extend(await get_mcp_tools(configurable))
-
+    tools.extend(await get_search_tool(search_api))
+    tools.extend(await _get_allowlisted_mcp_tools(
+        configurable,
+        configurable.documentation_mcp_tool_allowlist,
+    ))
     return tools
+
+
+async def get_all_tools(config: RunnableConfig) -> list[Any]:
+    """Compatibility inventory; Research Agents must use their scoped factories."""
+    from project_advisor.tools.rag_search import rag_ingest, rag_rebuild, rag_status
+
+    repository_tools = await get_repository_tools(config)
+    documentation_tools = await get_documentation_tools(config)
+    tools = [*repository_tools, *documentation_tools, rag_ingest, rag_rebuild, rag_status]
+    unique: dict[str, Any] = {}
+    for value in tools:
+        unique.setdefault(_tool_name(value), value)
+
+    return list(unique.values())
 
 
 # ===== Token 限制处理 =====

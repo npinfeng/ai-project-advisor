@@ -248,33 +248,37 @@ def test_document_store():
 
 
 def test_tools_registered():
-    """验证新工具已注册到 get_all_tools。"""
-    from project_advisor.utils import get_all_tools
-    from project_advisor.configuration import Configuration, SearchAPI
+    """验证两个 Research Agent 的工具权限真正隔离。"""
+    from project_advisor.utils import (
+        get_documentation_tools,
+        get_repository_tools,
+    )
     from langchain_core.runnables import RunnableConfig
     import asyncio
 
     config = RunnableConfig(configurable={"search_api": "none"})
 
     async def run():
-        tools = await get_all_tools(config)
-        tool_names = set()
-        for t in tools:
-            try:
-                if hasattr(t, "name"):
-                    tool_names.add(t.name)
-                elif isinstance(t, dict):
-                    tool_names.add(t.get("name", ""))
-            except Exception:
-                pass
-        assert "web_fetch_tool" in tool_names, f"Missing web_fetch_tool, got: {tool_names}"
-        assert "batch_fetch_tool" in tool_names, f"Missing batch_fetch_tool, got: {tool_names}"
-        assert "rag_search" in tool_names, f"Missing rag_search, got: {tool_names}"
-        assert "rag_ingest" in tool_names, f"Missing rag_ingest, got: {tool_names}"
-        assert "rag_rebuild" in tool_names, f"Missing rag_rebuild, got: {tool_names}"
-        assert "think_tool" in tool_names
-        assert "github_get_repo" in tool_names
-        print(f"All tools registered: {len(tools)} tools available")
+        repository = await get_repository_tools(config)
+        documentation = await get_documentation_tools(config)
+        repository_names = {
+            getattr(tool, "name", getattr(tool, "__name__", ""))
+            for tool in repository
+        }
+        documentation_names = {
+            getattr(tool, "name", getattr(tool, "__name__", ""))
+            for tool in documentation
+        }
+
+        assert "github_get_repo" in repository_names
+        assert "web_fetch_tool" not in repository_names
+        assert "rag_search" not in repository_names
+        assert "web_fetch_tool" in documentation_names
+        assert "batch_fetch_tool" in documentation_names
+        assert "rag_search" in documentation_names
+        assert "github_get_repo" not in documentation_names
+        assert "rag_ingest" not in documentation_names
+        assert "rag_rebuild" not in documentation_names
 
     asyncio.run(run())
 

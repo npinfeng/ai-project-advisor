@@ -1,15 +1,20 @@
 """Tests for the connected workflow topology and web demo."""
 
+import asyncio
 import importlib
 import json
 
 from fastapi.testclient import TestClient
+from langchain_core.messages import HumanMessage
 
 from project_advisor.graph import (
+    detect_evidence_gaps,
+    evidence_coverage,
+    graph,
     researcher_subgraph_doc,
     researcher_subgraph_repo,
-    supervisor_subgraph,
 )
+from project_advisor.agents.planner import build_research_tasks
 from project_advisor.agents.reviewer import _bind_scores_to_evidence
 from project_advisor.schemas.evidence import (
     CandidateRecommendation,
@@ -23,16 +28,74 @@ from project_advisor.tools.evidence_factory import build_evidences_from_tool_res
 
 
 def test_research_subgraphs_have_execution_loops():
-    supervisor_mermaid = supervisor_subgraph.get_graph().draw_mermaid()
+    workflow_mermaid = graph.get_graph().draw_mermaid()
     repository_mermaid = researcher_subgraph_repo.get_graph().draw_mermaid()
     documentation_mermaid = researcher_subgraph_doc.get_graph().draw_mermaid()
 
-    assert "supervisor -.-> supervisor_tools" in supervisor_mermaid
-    assert "supervisor_tools -.-> supervisor" in supervisor_mermaid
+    assert "research_supervisor" not in workflow_mermaid
+    assert "parallel_research" in workflow_mermaid
+    assert "evidence_coverage" in workflow_mermaid
+    assert "supplemental_research" in workflow_mermaid
     assert "repository_analyst -.-> analyst_tools" in repository_mermaid
-    assert "analyst_tools -.-> compress_research" in repository_mermaid
+    assert "summarize_evidence" in repository_mermaid
     assert "documentation_researcher -.-> doc_tools" in documentation_mermaid
-    assert "doc_tools -.-> compress_research" in documentation_mermaid
+    assert "summarize_evidence" in documentation_mermaid
+
+
+def test_planner_expands_typed_tasks_and_gap_round_is_bounded():
+    candidates = [CandidateRecommendation(
+        name="LangGraph",
+        github_url="https://github.com/langchain-ai/langgraph",
+        reason="匹配状态化工作流。",
+    )]
+    tasks = build_research_tasks(candidates, ["人工审批"])
+
+    assert [task.track for task in tasks] == ["repository", "documentation"]
+    assert all(task.project_name == "LangGraph" for task in tasks)
+    assert tasks[0].github_url == "https://github.com/langchain-ai/langgraph"
+
+    gaps = detect_evidence_gaps(["LangGraph"], [])
+    assert {gap.track for gap in gaps} == {"repository", "documentation"}
+    first_gate = evidence_coverage({
+        "candidates": ["LangGraph"],
+        "candidate_recommendations": candidates,
+        "evaluation_focus": ["人工审批"],
+        "evidences": [],
+        "supplemental_round_used": False,
+    })
+    assert first_gate["next"] == "supplemental_research"
+    assert first_gate["supplemental_round_used"] is True
+    assert all(task.round == 1 for task in first_gate["research_tasks"])
+
+    final_gate = evidence_coverage({
+        "candidates": ["LangGraph"],
+        "evidences": [],
+        "supplemental_round_used": True,
+    })
+    assert final_gate["next"] == "review_and_score"
+
+
+def test_manual_execution_plan_does_not_create_a_planner_model(monkeypatch):
+    planner_module = importlib.import_module("project_advisor.agents.planner")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("执行阶段不应重新调用 Planner 模型")
+
+    monkeypatch.setattr(planner_module, "create_chat_model", fail_if_called)
+    output = asyncio.run(planner_module.plan_evaluation({
+        "messages": [HumanMessage(content="比较 LangGraph 与 CrewAI。")],
+        "confirmed_candidates": ["LangGraph", "CrewAI"],
+    }, {}))
+
+    assert output["next"] == "parallel_research"
+    assert len(output["research_tasks"]) == 4
+    assert all(
+        "比较 LangGraph 与 CrewAI" in task.research_topic
+        for task in output["research_tasks"]
+    )
+    assert {task.track for task in output["research_tasks"]} == {
+        "repository", "documentation"
+    }
 
 
 def test_review_result_is_structured():
@@ -55,6 +118,41 @@ def test_review_result_is_structured():
 
     assert result.scores[0].project_name == "LangGraph"
     assert result.evidence_gaps
+
+
+def test_final_report_is_deterministic_and_does_not_create_a_model(monkeypatch):
+    reviewer_module = importlib.import_module("project_advisor.agents.reviewer")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("确定性报告节点不应创建模型")
+
+    monkeypatch.setattr(reviewer_module, "create_chat_model", fail_if_called)
+    evidence = Evidence(
+        source_url="https://docs.example.com/langgraph",
+        source_type="official_documentation",
+        project_name="LangGraph",
+        content="Durable execution is documented.",
+        relevance="feature_match",
+        retrieved_at="2026-07-23T08:00:00+00:00",
+    )
+    output = asyncio.run(reviewer_module.generate_report({
+        "research_brief": "评估状态化 Agent 框架。",
+        "candidates": ["LangGraph"],
+        "scores": [ProjectScore(
+            project_name="LangGraph",
+            feature_match=9,
+            weighted_total=8.5,
+            evidence_ids=[evidence.evidence_id],
+            source_urls=[evidence.source_url],
+        )],
+        "evidences": [evidence],
+        "review_analysis": "证据支持状态化执行能力。",
+        "review_evidence_gaps": [],
+    }, {}))
+
+    assert output["final_report"].startswith("# 技术选型评估报告")
+    assert evidence.evidence_id in output["final_report"]
+    assert evidence.source_url in output["final_report"]
 
 
 def test_tool_output_is_normalized_and_score_is_bound_to_evidence():
@@ -84,8 +182,9 @@ class FakeGraph:
         yield {"clarify_requirements": {"next": "plan_evaluation"}}
         yield {"plan_evaluation": {"candidates": ["LangGraph"]}}
         yield {
-            "research_supervisor": {
+            "parallel_research": {
                 "notes": ["Evidence"],
+                "next": "evidence_coverage",
                 "evidences": [
                     Evidence(
                         source_url="https://docs.example.com/langgraph",

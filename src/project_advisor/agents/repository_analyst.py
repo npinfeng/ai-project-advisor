@@ -1,13 +1,12 @@
 """Repository Analyst Agent — GitHub 仓库深度分析。
 
-作为子研究员运行，接收 Supervisor 分配的研究任务，
+作为子研究员运行，接收确定性工作流分配的仓库研究任务，
 使用 GitHub 工具收集仓库的工程数据并生成分析报告。
 """
 
 import asyncio
 
 from langchain_core.messages import (
-    HumanMessage,
     SystemMessage,
     ToolMessage,
     filter_messages,
@@ -20,9 +19,9 @@ from project_advisor.state import ResearcherState
 from project_advisor.tools.evidence_factory import build_evidences_from_tool_result
 from project_advisor.utils import (
     create_chat_model,
-    get_all_tools,
+    get_message_token_usage,
+    get_repository_tools,
     get_today_str,
-    think_tool,
 )
 
 
@@ -31,7 +30,7 @@ async def repository_analyst(state: ResearcherState, config: RunnableConfig):
     configurable = Configuration.from_runnable_config(config)
     researcher_messages = state.get("researcher_messages", [])
 
-    tools = await get_all_tools(config)
+    tools = await get_repository_tools(config)
     if not tools:
         raise ValueError("未配置任何工具。请在配置中启用搜索 API 或添加工具。")
 
@@ -51,6 +50,7 @@ async def repository_analyst(state: ResearcherState, config: RunnableConfig):
 
     return {
         "researcher_messages": [response],
+        "token_usage": get_message_token_usage(response),
         "tool_call_iterations": state.get("tool_call_iterations", 0) + 1,
         "next": "analyst_tools",
     }
@@ -92,7 +92,7 @@ async def analyst_tools(state: ResearcherState, config: RunnableConfig):
         tc for tc in most_recent.tool_calls if tc["name"] != "ResearchComplete"
     ]
 
-    tools = await get_all_tools(config)
+    tools = await get_repository_tools(config)
     tools_by_name = {
         getattr(t, "name", getattr(t, "__name__", "unknown")): t
         for t in tools
@@ -146,44 +146,25 @@ async def analyst_tools(state: ResearcherState, config: RunnableConfig):
 
 
 async def compress_research(state: ResearcherState, config: RunnableConfig):
-    """压缩研究发现 — 清理重复信息，保留所有关键数据。"""
-    configurable = Configuration.from_runnable_config(config)
-
-    synthesizer = create_chat_model(
-        configurable.compression_model,
-        max_tokens=configurable.compression_model_max_tokens,
-    )
-
+    """Deterministically summarize normalized evidence without another model call."""
     researcher_messages = state.get("researcher_messages", [])
-    researcher_messages.append(
-        HumanMessage(content="请清理以上研究发现。移除重复信息，但保留所有关键数据和来源 URL。")
-    )
-
-    compression_prompt = (
-        "你是一名技术分析师，刚完成了一个 GitHub 仓库的研究。"
-        "请整理你的发现，保留所有数据（Stars、Release、Issue 统计等）和 URL。"
-        "移除重复内容，但不要丢失任何数据点。"
-        f"当前日期：{get_today_str()}"
-    )
-
-    messages = [SystemMessage(content=compression_prompt)] + researcher_messages
-
-    try:
-        response = await synthesizer.ainvoke(messages)
-        compressed = str(response.content)
-    except Exception:
-        # 压缩失败则返回原始内容
-        compressed = "\n".join([
-            str(m.content) for m in filter_messages(
-                researcher_messages, include_types=["tool", "ai"]
-            )
-        ])
-
-    raw_notes = "\n".join([
+    raw_notes = "\n".join(
         str(m.content) for m in filter_messages(
-            researcher_messages, include_types=["tool", "ai"]
+            researcher_messages, include_types=["tool"]
         )
-    ])
+    )
+    seen: set[str] = set()
+    evidence_lines = []
+    for evidence in state.get("evidences", []):
+        evidence_id = getattr(evidence, "evidence_id", "")
+        if not evidence_id or evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+        evidence_lines.append(
+            f"- [{evidence_id}] {getattr(evidence, 'source_url', '')} — "
+            f"{str(getattr(evidence, 'content', ''))[:500]}"
+        )
+    compressed = "\n".join(evidence_lines) or raw_notes[:6000] or "未收集到仓库证据。"
 
     return {
         "compressed_research": compressed,

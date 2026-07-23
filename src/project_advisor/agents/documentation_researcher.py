@@ -1,13 +1,12 @@
 """Documentation Researcher Agent — 官方文档搜索和技术能力确认。
 
-作为子研究员运行，接收 Supervisor 分配的研究任务，
+作为子研究员运行，接收确定性工作流分配的文档研究任务，
 使用搜索工具查找官方文档、博客和技术资料。
 """
 
 import asyncio
 
 from langchain_core.messages import (
-    HumanMessage,
     SystemMessage,
     ToolMessage,
     filter_messages,
@@ -20,7 +19,8 @@ from project_advisor.state import ResearcherState
 from project_advisor.tools.evidence_factory import build_evidences_from_tool_result
 from project_advisor.utils import (
     create_chat_model,
-    get_all_tools,
+    get_documentation_tools,
+    get_message_token_usage,
     get_today_str,
 )
 
@@ -30,7 +30,7 @@ async def documentation_researcher(state: ResearcherState, config: RunnableConfi
     configurable = Configuration.from_runnable_config(config)
     researcher_messages = state.get("researcher_messages", [])
 
-    tools = await get_all_tools(config)
+    tools = await get_documentation_tools(config)
     if not tools:
         raise ValueError("未配置任何工具。请在配置中启用搜索 API。")
 
@@ -50,6 +50,7 @@ async def documentation_researcher(state: ResearcherState, config: RunnableConfi
 
     return {
         "researcher_messages": [response],
+        "token_usage": get_message_token_usage(response),
         "tool_call_iterations": state.get("tool_call_iterations", 0) + 1,
         "next": "doc_tools",
     }
@@ -90,7 +91,7 @@ async def doc_tools(state: ResearcherState, config: RunnableConfig):
         tc for tc in most_recent.tool_calls if tc["name"] != "ResearchComplete"
     ]
 
-    tools = await get_all_tools(config)
+    tools = await get_documentation_tools(config)
     tools_by_name = {
         getattr(t, "name", getattr(t, "__name__", "unknown")): t
         for t in tools
@@ -142,43 +143,25 @@ async def doc_tools(state: ResearcherState, config: RunnableConfig):
 
 
 async def compress_research(state: ResearcherState, config: RunnableConfig):
-    """压缩文档研究发现 — 清理重复信息，保留所有 URL 和关键结论。"""
-    configurable = Configuration.from_runnable_config(config)
-
-    synthesizer = create_chat_model(
-        configurable.compression_model,
-        max_tokens=configurable.compression_model_max_tokens,
-    )
-
+    """Deterministically summarize normalized evidence without another model call."""
     researcher_messages = state.get("researcher_messages", [])
-    researcher_messages.append(
-        HumanMessage(content="请清理以上文档研究发现。保留所有 URL、文档版本和关键结论，移除重复信息。")
-    )
-
-    compression_prompt = (
-        "你是一名技术文档研究员，刚完成了项目文档的搜索和分析。"
-        "请整理你的发现，保留所有来源 URL、文档版本、关键功能确认和架构分析。"
-        "移除重复内容，但不要丢失任何引用信息。"
-        f"当前日期：{get_today_str()}"
-    )
-
-    messages = [SystemMessage(content=compression_prompt)] + researcher_messages
-
-    try:
-        response = await synthesizer.ainvoke(messages)
-        compressed = str(response.content)
-    except Exception:
-        compressed = "\n".join([
-            str(m.content) for m in filter_messages(
-                researcher_messages, include_types=["tool", "ai"]
-            )
-        ])
-
-    raw_notes = "\n".join([
+    raw_notes = "\n".join(
         str(m.content) for m in filter_messages(
-            researcher_messages, include_types=["tool", "ai"]
+            researcher_messages, include_types=["tool"]
         )
-    ])
+    )
+    seen: set[str] = set()
+    evidence_lines = []
+    for evidence in state.get("evidences", []):
+        evidence_id = getattr(evidence, "evidence_id", "")
+        if not evidence_id or evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+        evidence_lines.append(
+            f"- [{evidence_id}] {getattr(evidence, 'source_url', '')} — "
+            f"{str(getattr(evidence, 'content', ''))[:500]}"
+        )
+    compressed = "\n".join(evidence_lines) or raw_notes[:6000] or "未收集到文档证据。"
 
     return {
         "compressed_research": compressed,
