@@ -51,6 +51,7 @@ class IngestionPipeline:
         documents = []
         for ev in evidences:
             documents.append({
+                "evidence_id": ev.evidence_id,
                 "content": ev.content,
                 "source_url": ev.source_url,
                 "source_type": ev.source_type,

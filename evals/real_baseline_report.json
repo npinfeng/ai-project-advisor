@@ -1,0 +1,15 @@
+{
+  "case_count": 10,
+  "k": 5,
+  "recall_at_k": 0.895,
+  "precision_at_k": 0.78,
+  "mrr": 1.0,
+  "ndcg_at_k": 0.904046,
+  "citation_accuracy": 0.903226,
+  "citation_coverage": 0.9,
+  "task_success_rate": 0.8,
+  "latency_p50_ms": 27000.0,
+  "latency_p95_ms": 34680.0,
+  "average_tokens": 21220.0,
+  "average_cost_usd": 0.0792
+}

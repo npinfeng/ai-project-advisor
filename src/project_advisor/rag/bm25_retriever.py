@@ -6,10 +6,13 @@
 - 轻量级，不需要 GPU
 """
 
+import hashlib
+import json
+import os
 import re
+from pathlib import Path
 from typing import Optional
 
-import numpy as np
 from rank_bm25 import BM25Okapi
 
 
@@ -20,9 +23,68 @@ class BM25Retriever:
     支持项目级过滤和 Top-K 检索。
     """
 
-    def __init__(self):
-        """初始化 BM25 检索器。"""
+    def __init__(self, storage_dir: str | Path | None = "./data/bm25"):
+        """初始化 BM25 检索器，并恢复磁盘上的项目索引。"""
         self._indexes: dict[str, dict] = {}  # project_name → {corpus, bm25, metadata}
+        self.storage_dir = Path(storage_dir) if storage_dir is not None else None
+        if self.storage_dir is not None:
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
+            self._load_all()
+
+    def _project_file(self, project_name: str) -> Path:
+        if self.storage_dir is None:
+            raise RuntimeError("BM25 persistence is disabled.")
+        digest = hashlib.sha256(project_name.encode("utf-8")).hexdigest()[:16]
+        return self.storage_dir / f"{digest}.json"
+
+    def _build_index(self, project_name: str, chunks: list[dict]) -> None:
+        corpus = [chunk["text"] for chunk in chunks]
+        tokenized = [self._tokenize(doc) for doc in corpus]
+        self._indexes[project_name] = {
+            "corpus": corpus,
+            "tokenized": tokenized,
+            "bm25": BM25Okapi(tokenized),
+            "metadata": [chunk.get("metadata", {}) for chunk in chunks],
+            "ids": [
+                chunk.get("id")
+                or chunk.get("metadata", {}).get("chunk_id")
+                or f"bm25_{project_name}_{index}"
+                for index, chunk in enumerate(chunks)
+            ],
+        }
+
+    def _save_index(self, project_name: str) -> None:
+        if self.storage_dir is None:
+            return
+        data = self._indexes[project_name]
+        payload = {
+            "project_name": project_name,
+            "chunks": [
+                {"id": doc_id, "text": text, "metadata": metadata}
+                for doc_id, text, metadata in zip(
+                    data["ids"], data["corpus"], data["metadata"]
+                )
+            ],
+        }
+        path = self._project_file(project_name)
+        temporary_path = path.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(temporary_path, path)
+
+    def _load_all(self) -> None:
+        if self.storage_dir is None:
+            return
+        for path in self.storage_dir.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                project_name = str(payload["project_name"])
+                chunks = payload.get("chunks", [])
+                if chunks:
+                    self._build_index(project_name, chunks)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
@@ -49,18 +111,10 @@ class BM25Retriever:
             chunks: chunk 列表，每个包含 text 和 metadata
         """
         if not chunks:
+            self.clear_project(project_name)
             return
-
-        corpus = [chunk["text"] for chunk in chunks]
-        tokenized = [self._tokenize(doc) for doc in corpus]
-        bm25 = BM25Okapi(tokenized)
-
-        self._indexes[project_name] = {
-            "corpus": corpus,
-            "tokenized": tokenized,
-            "bm25": bm25,
-            "metadata": [chunk.get("metadata", {}) for chunk in chunks],
-        }
+        self._build_index(project_name, chunks)
+        self._save_index(project_name)
 
     def search(
         self,
@@ -103,7 +157,7 @@ class BM25Retriever:
             for i, score in enumerate(normalized):
                 if score > 0:
                     all_results.append({
-                        "id": f"bm25_{proj}_{i}",
+                        "id": index_data["ids"][i],
                         "text": index_data["corpus"][i],
                         "metadata": index_data["metadata"][i],
                         "score": float(score),
@@ -116,9 +170,23 @@ class BM25Retriever:
     def clear_project(self, project_name: str):
         """清除项目的 BM25 索引。"""
         self._indexes.pop(project_name, None)
+        if self.storage_dir is not None:
+            path = self._project_file(project_name)
+            if path.exists():
+                path.unlink()
 
-    def count(self) -> int:
+    def count(self, project_name: Optional[str] = None) -> int:
         """统计已索引的文档数量。"""
+        if project_name is not None:
+            return len(self._indexes.get(project_name, {}).get("corpus", []))
         return sum(
             len(idx["corpus"]) for idx in self._indexes.values()
         )
+
+    def list_projects(self) -> list[str]:
+        """列出已经恢复或构建 BM25 索引的项目。"""
+        return list(self._indexes)
+
+    def document_ids(self, project_name: str) -> set[str]:
+        """Return stable chunk IDs in a project's keyword index."""
+        return set(self._indexes.get(project_name, {}).get("ids", []))

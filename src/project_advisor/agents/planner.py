@@ -16,6 +16,7 @@ from project_advisor.prompts import (
     planner_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
+from project_advisor.schemas.evidence import CandidateRecommendation
 from project_advisor.state import AgentState, ClarifyWithUser, ResearchPlan
 from project_advisor.utils import create_chat_model, get_today_str
 
@@ -61,16 +62,12 @@ async def clarify_requirements(state: AgentState, config: RunnableConfig):
     }
 
 
-async def plan_evaluation(state: AgentState, config: RunnableConfig):
-    """生成结构化研究计划和候选项目列表。
-
-    将用户消息转化为：
-    1. ResearchBrief — 详细的研究简报
-    2. Candidates — 候选项目列表
-    3. EvaluationFocus — 重点评估维度
-    """
+async def generate_research_plan(
+    messages: list,
+    config: RunnableConfig,
+) -> ResearchPlan:
+    """Generate the reusable structured plan used by preview and execution."""
     configurable = Configuration.from_runnable_config(config)
-
     research_model = (
         create_chat_model(
             configurable.research_model,
@@ -81,10 +78,62 @@ async def plan_evaluation(state: AgentState, config: RunnableConfig):
     )
 
     prompt = transform_messages_into_research_topic_prompt.format(
-        messages=get_buffer_string(state.get("messages", [])),
+        messages=get_buffer_string(messages),
         date=get_today_str(),
     )
-    response = await research_model.ainvoke([HumanMessage(content=prompt)])
+    return await research_model.ainvoke([HumanMessage(content=prompt)])
+
+
+def _apply_confirmed_candidates(
+    plan: ResearchPlan,
+    confirmed_candidates: list[str],
+) -> ResearchPlan:
+    """Keep user-confirmed names while preserving Planner explanations when possible."""
+    if not confirmed_candidates:
+        return plan
+    recommendation_map = {
+        item.name.casefold(): item for item in plan.candidates
+    }
+    recommendations = []
+    for name in confirmed_candidates:
+        existing = recommendation_map.get(name.casefold())
+        recommendations.append(
+            existing
+            if existing is not None
+            else CandidateRecommendation(
+                name=name,
+                reason="用户在候选确认阶段手动指定。",
+            )
+        )
+    brief = (
+        f"{plan.research_brief}\n\n"
+        f"用户最终确认的候选项目：{'、'.join(confirmed_candidates)}。"
+    )
+    return plan.model_copy(
+        update={"candidates": recommendations, "research_brief": brief}
+    )
+
+
+async def plan_evaluation(state: AgentState, config: RunnableConfig):
+    """Generate or reuse a confirmed structured research plan."""
+    confirmed_plan = state.get("confirmed_plan")
+    if confirmed_plan:
+        response = (
+            confirmed_plan
+            if isinstance(confirmed_plan, ResearchPlan)
+            else ResearchPlan.model_validate(confirmed_plan)
+        )
+    else:
+        response = await generate_research_plan(
+            state.get("messages", []),
+            config,
+        )
+
+    response = _apply_confirmed_candidates(
+        response,
+        state.get("confirmed_candidates", []),
+    )
+    candidate_names = [candidate.name for candidate in response.candidates]
 
     # 初始化 Supervisor 上下文
     supervisor_system_prompt = planner_system_prompt.format(
@@ -92,13 +141,22 @@ async def plan_evaluation(state: AgentState, config: RunnableConfig):
     )
 
     return {
+        "requirements": response.requirements,
         "research_brief": response.research_brief,
-        "candidates": response.candidates,
+        "candidates": candidate_names,
+        "candidate_recommendations": response.candidates,
+        "evaluation_focus": response.evaluation_focus,
         "supervisor_messages": {
             "type": "override",
             "value": [
                 SystemMessage(content=supervisor_system_prompt),
-                HumanMessage(content=response.research_brief),
+                HumanMessage(
+                    content=(
+                        f"{response.research_brief}\n\n"
+                        f"候选项目：{'、'.join(candidate_names)}\n"
+                        f"重点维度：{'、'.join(response.evaluation_focus)}"
+                    )
+                ),
             ],
         },
         "next": "research_supervisor",

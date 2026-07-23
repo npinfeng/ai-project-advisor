@@ -17,6 +17,7 @@ from langchain_core.runnables import RunnableConfig
 from project_advisor.configuration import Configuration
 from project_advisor.prompts import doc_researcher_system_prompt
 from project_advisor.state import ResearcherState
+from project_advisor.tools.evidence_factory import build_evidences_from_tool_result
 from project_advisor.utils import (
     create_chat_model,
     get_all_tools,
@@ -54,15 +55,23 @@ async def documentation_researcher(state: ResearcherState, config: RunnableConfi
     }
 
 
-async def execute_tool_safely(tool, args, config):
+async def execute_tool_safely(
+    tool, args, config, *, project_name: str, research_topic: str
+):
     """安全执行工具。"""
     if tool is None:
-        return "工具执行出错：未找到对应工具。"
+        return "工具执行出错：未找到对应工具。", []
     try:
         result = await tool.ainvoke(args, config)
-        return str(result)
+        return str(result), build_evidences_from_tool_result(
+            tool_name=getattr(tool, "name", getattr(tool, "__name__", "unknown")),
+            args=args,
+            result=result,
+            project_name=project_name,
+            research_topic=research_topic,
+        )
     except Exception as e:
-        return f"工具执行出错：{str(e)}"
+        return f"工具执行出错：{str(e)}", []
 
 
 async def doc_tools(state: ResearcherState, config: RunnableConfig):
@@ -86,21 +95,26 @@ async def doc_tools(state: ResearcherState, config: RunnableConfig):
         getattr(t, "name", getattr(t, "__name__", "unknown")): t
         for t in tools
     }
+    project_name = state.get("project_name", "")
+    research_topic = state.get("research_topic", "")
 
     tool_tasks = [
         execute_tool_safely(
             tools_by_name.get(tc["name"]),
             tc["args"],
             config,
+            project_name=project_name,
+            research_topic=research_topic,
         )
         for tc in executable_calls
     ]
     observations = await asyncio.gather(*tool_tasks)
 
     tool_messages = [
-        ToolMessage(content=obs, name=tc["name"], tool_call_id=tc["id"])
+        ToolMessage(content=obs[0], name=tc["name"], tool_call_id=tc["id"])
         for obs, tc in zip(observations, executable_calls)
     ]
+    evidences = [evidence for _, batch in observations for evidence in batch]
     tool_messages.extend(
         ToolMessage(
             content="研究完成信号已确认。",
@@ -116,11 +130,13 @@ async def doc_tools(state: ResearcherState, config: RunnableConfig):
     if exceeded or research_complete:
         return {
             "researcher_messages": tool_messages,
+            "evidences": evidences,
             "next": "compress_research",
         }
 
     return {
         "researcher_messages": tool_messages,
+        "evidences": evidences,
         "next": "documentation_researcher",
     }
 

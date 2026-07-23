@@ -104,6 +104,30 @@ input { height: 50px; padding: 0 16px; }
 textarea:focus, input:focus { border-color: rgba(31,107,85,.65); box-shadow: 0 0 0 4px rgba(31,107,85,.08); }
 .field-meta { display: flex; justify-content: space-between; gap: 12px; margin-top: 7px; color: var(--muted); font-size: 11px; }
 
+.candidate-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 22px 0 0; padding: 0; border: 0; }
+.candidate-mode legend { margin-bottom: 9px; font-size: 13px; font-weight: 750; }
+.mode-option { display: flex; gap: 10px; align-items: flex-start; margin: 0; padding: 13px; border: 1px solid var(--line); border-radius: 14px; background: rgba(250,249,245,.55); cursor: pointer; }
+.mode-option:has(input:checked) { border-color: rgba(31,107,85,.7); box-shadow: 0 0 0 3px rgba(31,107,85,.07); }
+.mode-option input { flex: 0 0 auto; width: 16px; height: 16px; margin-top: 2px; accent-color: var(--green); }
+.mode-option span { display: grid; gap: 3px; color: var(--ink); }
+.mode-option small, .candidate-help, #requirementsSummary { color: var(--muted); font-size: 11px; font-weight: 400; line-height: 1.5; }
+.candidate-help { margin: 9px 0 0; }
+.candidate-preview { margin-top: 18px; padding: 16px; border: 1px solid rgba(31,107,85,.25); border-radius: 16px; background: rgba(223,238,177,.14); }
+.candidate-preview-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.candidate-preview-heading h3 { margin: 3px 0 0; font-size: 18px; }
+.candidate-preview-heading > span { color: var(--green); font-size: 12px; font-weight: 750; }
+#requirementsSummary { margin: 10px 0 12px; }
+.candidate-list { display: grid; gap: 8px; }
+.candidate-card { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.62); }
+.candidate-card strong { font-size: 13px; }
+.candidate-card p { grid-column: 1; margin: 3px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.candidate-card a { color: var(--green); font-size: 11px; }
+.candidate-remove, .candidate-add-row button { border: 1px solid var(--line); border-radius: 9px; background: transparent; cursor: pointer; }
+.candidate-remove { grid-column: 2; grid-row: 1 / span 2; align-self: center; padding: 7px 9px; color: var(--accent-dark); font-size: 11px; }
+.candidate-add-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 10px; }
+.candidate-add-row input { height: 42px; }
+.candidate-add-row button { padding: 0 15px; color: var(--green); font-weight: 700; }
+
 .examples { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 18px; }
 .examples span { margin-right: 4px; color: var(--muted); font-size: 11px; }
 .examples button, .text-button { border: 1px solid var(--line); background: transparent; cursor: pointer; }
@@ -146,6 +170,28 @@ textarea:focus, input:focus { border-color: rgba(31,107,85,.65); box-shadow: 0 0
 .results-heading > div:last-child { display: flex; gap: 8px; }
 .text-button { padding: 9px 12px; border-color: rgba(255,255,255,.18); border-radius: 10px; color: #dbe7e1; font-size: 11px; }
 .text-button:hover { border-color: var(--lime); color: var(--lime); }
+.evaluation-panel { margin-top: 22px; padding: 30px; border: 1px solid rgba(255,255,255,.75); border-radius: 26px; background: var(--panel); box-shadow: var(--shadow); }
+.evaluation-heading, .diagnostics-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.evaluation-heading h2 { margin: 9px 0 6px; font: 600 28px/1.2 Georgia, "Songti SC", serif; }
+.evaluation-heading p { margin: 0; color: var(--muted); font-size: 11px; }
+.metric-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 24px; }
+.metric-card { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 15px; background: rgba(255,255,255,.42); }
+.metric-card span, .metric-card strong { display: block; }
+.metric-card span { min-height: 28px; color: var(--muted); font-size: 10px; line-height: 1.35; }
+.metric-card strong { margin-top: 8px; color: var(--green); font: 600 20px/1 Georgia, serif; }
+.runtime-diagnostics { margin: 26px 0; padding: 22px; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; background: rgba(255,255,255,.035); }
+.diagnostics-heading h3 { margin: 8px 0 0; color: #fff; font: 600 20px/1.2 Georgia, "Songti SC", serif; }
+.diagnostics-heading > span { color: #91a59b; font-size: 10px; }
+.diagnostic-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; margin-top: 20px; }
+.diagnostic-grid > div { min-width: 0; padding: 13px; border-radius: 12px; background: rgba(255,255,255,.05); }
+.diagnostic-grid span, .diagnostic-grid strong { display: block; }
+.diagnostic-grid span { min-height: 25px; color: #91a59b; font-size: 9px; line-height: 1.35; }
+.diagnostic-grid strong { margin-top: 5px; color: var(--lime); font: 600 15px/1.2 Georgia, serif; overflow-wrap: anywhere; }
+.stage-duration-list { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin-top: 14px; overflow: hidden; border-radius: 10px; background: rgba(255,255,255,.08); }
+.stage-duration-list div { padding: 10px; background: #18312b; }
+.stage-duration-list span, .stage-duration-list strong { display: block; }
+.stage-duration-list span { color: #91a59b; font-size: 8px; }
+.stage-duration-list strong { margin-top: 5px; color: #fff; font: 600 11px/1 monospace; }
 .score-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 26px 0; }
 .score-card { padding: 18px; border: 1px solid rgba(255,255,255,.1); border-radius: 16px; background: rgba(255,255,255,.045); }
 .score-card header { display: flex; justify-content: space-between; gap: 12px; }
@@ -174,6 +220,8 @@ footer { min-height: 100px; display: flex; align-items: center; justify-content:
   .hero { grid-template-columns: 1fr; }
   .hero-metrics { justify-content: flex-start; }
   .workspace { grid-template-columns: 1fr; }
+  .metric-grid, .diagnostic-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .stage-duration-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 600px) {
@@ -185,7 +233,9 @@ footer { min-height: 100px; display: flex; align-items: center; justify-content:
   .hero h1 .headline-ink { font-size: 37px; }
   .hero-metrics { width: 100%; }
   .hero-metrics div { flex: 1; min-width: 0; padding: 13px; }
-  .panel, .results { padding: 22px; border-radius: 20px; }
+  .panel, .results, .evaluation-panel { padding: 22px; border-radius: 20px; }
   .field-meta span:first-child { display: none; }
+  .candidate-mode { grid-template-columns: 1fr; }
   .results-heading, footer { align-items: flex-start; flex-direction: column; }
+  .metric-grid, .diagnostic-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

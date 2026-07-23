@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import logging
 from typing import Literal
 
 from langchain_core.messages import (
@@ -35,6 +36,7 @@ from project_advisor.agents.repository_analyst import (
 )
 from project_advisor.agents.reviewer import generate_report, review_and_score
 from project_advisor.configuration import Configuration
+from project_advisor.rag.knowledge_store import persist_evidences
 from project_advisor.state import (
     AgentInputState,
     AgentState,
@@ -54,6 +56,8 @@ from project_advisor.utils import (
     remove_up_to_last_ai_message,
     think_tool,
 )
+
+logger = logging.getLogger(__name__)
 
 # ===== 研究主管 =====
 
@@ -161,6 +165,20 @@ async def supervisor_tools(
             if raw_notes_concat:
                 update_payload["raw_notes"] = [raw_notes_concat]
 
+            evidences = [
+                evidence
+                for result in tool_results
+                for evidence in result.get("evidences", [])
+            ]
+            if evidences:
+                update_payload["evidences"] = evidences
+                try:
+                    update_payload["knowledge_stats"] = await asyncio.to_thread(
+                        persist_evidences, evidences
+                    )
+                except Exception:
+                    logger.exception("Failed to persist reusable research evidence")
+
         except Exception as e:
             if _is_token_error(e, configurable.research_model):
                 return {
@@ -178,6 +196,7 @@ async def _run_researcher_task(
 ) -> dict:
     """执行单个研究任务 — 调用 Researcher 子图。"""
     topic = tool_call["args"].get("research_topic", "")
+    project_name = tool_call["args"].get("project_name", "")
 
     # 根据研究主题选择研究员类型
     # 如果主题涉及 GitHub、仓库、stars、release 等关键词，使用 Repository Analyst
@@ -188,11 +207,13 @@ async def _run_researcher_task(
         return await researcher_subgraph_repo.ainvoke({
             "researcher_messages": [HumanMessage(content=topic)],
             "research_topic": topic,
+            "project_name": project_name,
         }, config)
     else:
         return await researcher_subgraph_doc.ainvoke({
             "researcher_messages": [HumanMessage(content=topic)],
             "research_topic": topic,
+            "project_name": project_name,
         }, config)
 
 

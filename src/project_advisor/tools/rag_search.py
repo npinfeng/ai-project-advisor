@@ -41,6 +41,40 @@ def _get_reranker() -> Reranker:
     return _reranker
 
 
+def _sync_from_store(
+    project_name: str = "",
+    *,
+    force: bool = False,
+) -> list[dict]:
+    """Synchronize persisted Evidence into both vector and BM25 indexes."""
+    from project_advisor.rag.document_store import DocumentStore
+
+    store = DocumentStore()
+    available_projects = store.get_stats().get("projects", [])
+    if project_name:
+        resolved = next(
+            (
+                name for name in available_projects
+                if name.casefold() == project_name.casefold()
+            ),
+            project_name,
+        )
+        targets = [resolved] if resolved in available_projects else []
+    else:
+        targets = available_projects
+    if not targets:
+        return []
+
+    pipeline = _get_pipeline()
+    sync_results = []
+    for target in targets:
+        if force:
+            pipeline.hybrid.clear(target)
+        stats = pipeline.ingest_from_store(store, target)
+        sync_results.append({"project_name": target, **stats})
+    return sync_results
+
+
 @tool(description="Search the local knowledge base for technical documentation. Use this for precise queries about specific capabilities, APIs, or architecture details of candidate projects.")
 def rag_search(
     query: str,
@@ -63,6 +97,11 @@ def rag_search(
     Returns:
         格式化的搜索结果
     """
+    sync_results = _sync_from_store(project_name)
+    if not sync_results:
+        scope = f"项目 {project_name}" if project_name else "任何项目"
+        return f"本地知识库中还没有 {scope} 的持久化证据。"
+
     pipeline = _get_pipeline()
     rewriter = _get_rewriter()
 
@@ -70,7 +109,7 @@ def rag_search(
     rewritten = rewriter.rewrite_sync(query)
 
     # 混合检索
-    proj = project_name if project_name else None
+    proj = sync_results[0]["project_name"] if project_name else None
     results = pipeline.search(
         query=rewritten,
         project_name=proj,
@@ -116,20 +155,34 @@ def rag_ingest(
     Returns:
         索引统计信息
     """
-    from project_advisor.rag.document_store import DocumentStore
-
-    store = DocumentStore()
-    pipeline = _get_pipeline()
-
-    stats = pipeline.ingest_from_store(store, project_name)
+    sync_results = _sync_from_store(project_name)
+    stats = sync_results[0] if sync_results else {}
 
     return (
         f"RAG 索引完成。\n"
         f"- 项目：{project_name}\n"
         f"- 分块数：{stats.get('chunks', 0)}\n"
         f"- 向量索引：{stats.get('vector_indexed', 0)}\n"
+        f"- 向量总数：{stats.get('vector_total', 0)}\n"
+        f"- 清理旧向量：{stats.get('vector_removed', 0)}\n"
         f"- BM25 索引：{stats.get('bm25_indexed', 0)}"
     )
+
+
+@tool(description="Rebuild persistent vector and BM25 indexes from stored Evidence. Use after changing chunking or embedding configuration.")
+def rag_rebuild(project_name: str = "") -> str:
+    """强制从 DocumentStore 重建一个项目或全部项目的检索索引。"""
+    results = _sync_from_store(project_name, force=True)
+    if not results:
+        return "没有可重建的持久化证据。"
+    lines = ["RAG 索引重建完成："]
+    for result in results:
+        lines.append(
+            f"- {result['project_name']}：{result.get('chunks', 0)} 个分块，"
+            f"{result.get('vector_total', 0)} 个向量，"
+            f"{result.get('bm25_indexed', 0)} 个 BM25 文档"
+        )
+    return "\n".join(lines)
 
 
 @tool(description="Check the status of the RAG knowledge base — which projects are indexed and how many documents.")
@@ -140,22 +193,30 @@ def rag_status() -> str:
         格式化的状态信息
     """
     from project_advisor.rag.document_store import DocumentStore
+    from project_advisor.rag.bm25_retriever import BM25Retriever
     from project_advisor.rag.vector_store import VectorStore
 
     store = DocumentStore()
     vs = VectorStore()
+    bm25 = BM25Retriever()
 
     store_stats = store.get_stats()
     lines = [
         "RAG 知识库状态：\n",
         f"存储目录：{store_stats['storage_dir']}",
         f"文档总数：{store_stats['total_documents']}",
-        f"向量索引文档数：{vs.count()}",
+        f"向量分块总数：{vs.count()}",
+        f"BM25 分块总数：{bm25.count()}",
         "\n各项目详情：",
     ]
 
     for proj, count in store_stats.get("docs_per_project", {}).items():
         vs_count = vs.count(proj)
-        lines.append(f"  - {proj}：{count} 个文档，{vs_count} 个向量")
+        bm25_count = bm25.count(proj)
+        state = "已建立双路索引" if vs_count and bm25_count else "待同步"
+        lines.append(
+            f"  - {proj}：{count} 个证据，{vs_count} 个向量，"
+            f"{bm25_count} 个 BM25 分块（{state}）"
+        )
 
     return "\n".join(lines)

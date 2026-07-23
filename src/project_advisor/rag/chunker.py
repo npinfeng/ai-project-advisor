@@ -1,12 +1,8 @@
-"""文档分块器 — 智能分割技术文档，保留语义边界。
+"""文档分块器 — 按标题、段落和句子边界递归切分技术文档。"""
 
-使用 LangChain 的 RecursiveCharacterTextSplitter，
-支持按标题、段落和句子边界进行智能分块。
-"""
+import hashlib
 
 from typing import Optional
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # 默认分块配置
 DEFAULT_CHUNK_SIZE = 1000  # 每个 chunk 的字符数
@@ -31,24 +27,66 @@ class DocumentChunker:
             chunk_size: 每个 chunk 的目标字符数
             chunk_overlap: 相邻 chunk 的重叠字符数
         """
+        if chunk_size < 1:
+            raise ValueError("chunk_size 必须大于 0。")
+        if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap 必须大于等于 0 且小于 chunk_size。")
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self._splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separators=[
-                "\n## ",  # Markdown H2
-                "\n### ",  # Markdown H3
-                "\n#### ",  # Markdown H4
-                "\n\n",  # 段落
-                "\n",  # 行
-                ". ",  # 句子
-                " ",  # 词
-                "",  # 字符
-            ],
-            length_function=len,
-            is_separator_regex=False,
-        )
+        self.separators = [
+            "\n## ",
+            "\n### ",
+            "\n#### ",
+            "\n\n",
+            "\n",
+            ". ",
+            " ",
+            "",
+        ]
+
+    def _segments(self, text: str, separator_index: int = 0) -> list[str]:
+        """Recursively split oversized text while retaining separators."""
+        if len(text) <= self.chunk_size:
+            return [text]
+        if separator_index >= len(self.separators):
+            return [
+                text[index:index + self.chunk_size]
+                for index in range(0, len(text), self.chunk_size)
+            ]
+
+        separator = self.separators[separator_index]
+        if not separator:
+            return list(text)
+        if separator not in text:
+            return self._segments(text, separator_index + 1)
+
+        raw_parts = text.split(separator)
+        parts = [raw_parts[0], *[separator + part for part in raw_parts[1:]]]
+        segments: list[str] = []
+        for part in parts:
+            if not part:
+                continue
+            segments.extend(self._segments(part, separator_index + 1))
+        return segments
+
+    def _merge_segments(self, segments: list[str]) -> list[str]:
+        chunks: list[str] = []
+        current = ""
+        for segment in segments:
+            if len(current) + len(segment) <= self.chunk_size:
+                current += segment
+                continue
+            if current.strip():
+                chunks.append(current.strip())
+            overlap = current[-self.chunk_overlap:] if self.chunk_overlap else ""
+            current = overlap + segment
+            while len(current) > self.chunk_size:
+                chunks.append(current[:self.chunk_size].strip())
+                start = self.chunk_size - self.chunk_overlap
+                current = current[start:]
+        if current.strip():
+            chunks.append(current.strip())
+        return chunks
 
     def chunk_document(
         self, content: str, metadata: Optional[dict] = None
@@ -65,15 +103,29 @@ class DocumentChunker:
         if metadata is None:
             metadata = {}
 
-        chunks = self._splitter.create_documents(
-            texts=[content],
-            metadatas=[metadata],
-        )
-
-        return [
-            {"text": chunk.page_content, "metadata": chunk.metadata}
-            for chunk in chunks
-        ]
+        if not content.strip():
+            return []
+        chunks = self._merge_segments(self._segments(content))
+        results = []
+        for index, chunk in enumerate(chunks):
+            source_url = str(metadata.get("source_url", ""))
+            project_name = str(metadata.get("project_name", ""))
+            identity = "\x1f".join([project_name, source_url, chunk])
+            chunk_id = f"chunk_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+            chunk_metadata = {
+                **metadata,
+                "chunk_id": chunk_id,
+                "chunk_index": index,
+                "content_hash": hashlib.sha256(
+                    chunk.encode("utf-8")
+                ).hexdigest(),
+            }
+            results.append({
+                "id": chunk_id,
+                "text": chunk,
+                "metadata": chunk_metadata,
+            })
+        return results
 
     def chunk_documents(
         self, documents: list[dict]
@@ -96,6 +148,7 @@ class DocumentChunker:
                     "project_name": doc.get("project_name", ""),
                     "version_info": doc.get("version_info", ""),
                     "retrieved_at": doc.get("retrieved_at", ""),
+                    "evidence_id": doc.get("evidence_id", ""),
                     **(doc.get("metadata", {})),
                 },
             )

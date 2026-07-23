@@ -7,7 +7,8 @@
 - 与 DocumentStore 同步
 """
 
-import os
+import hashlib
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +42,27 @@ class VectorStore:
             settings=Settings(anonymized_telemetry=False),
         )
         self._collections: dict[str, chromadb.Collection] = {}
+        self._discover_collections()
+
+    def _discover_collections(self) -> None:
+        """Restore persisted project collections after a process restart."""
+        try:
+            collections = self._client.list_collections()
+        except Exception:
+            return
+        for item in collections:
+            try:
+                collection = (
+                    item
+                    if hasattr(item, "count")
+                    else self._client.get_collection(name=str(item))
+                )
+                metadata = getattr(collection, "metadata", None) or {}
+                project_name = metadata.get("project")
+                if project_name:
+                    self._collections[str(project_name)] = collection
+            except Exception:
+                continue
 
     def _get_collection_name(self, project_name: str) -> str:
         """获取项目的 Collection 名称。"""
@@ -68,6 +90,34 @@ class VectorStore:
         self._collections[project_name] = collection
         return collection
 
+    def _get_existing_collection(
+        self, project_name: str
+    ) -> Optional[chromadb.Collection]:
+        if project_name in self._collections:
+            return self._collections[project_name]
+        try:
+            collection = self._client.get_collection(
+                name=self._get_collection_name(project_name)
+            )
+        except Exception:
+            return None
+        self._collections[project_name] = collection
+        return collection
+
+    @staticmethod
+    def _metadata_for_chroma(metadata: dict) -> dict:
+        normalized = {}
+        for key, value in metadata.items():
+            if value is None:
+                normalized[str(key)] = ""
+            elif isinstance(value, (str, int, float, bool)):
+                normalized[str(key)] = value
+            else:
+                normalized[str(key)] = json.dumps(
+                    value, ensure_ascii=False, default=str
+                )
+        return normalized
+
     def add_documents(
         self,
         project_name: str,
@@ -86,6 +136,8 @@ class VectorStore:
         """
         if not chunks or not embeddings:
             return 0
+        if len(chunks) != len(embeddings):
+            raise ValueError("chunks 与 embeddings 数量必须一致。")
 
         collection = self._get_or_create_collection(project_name)
 
@@ -94,18 +146,23 @@ class VectorStore:
         metadatas = []
         embeds = []
 
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            # 用 URL + 内容哈希生成唯一 ID
-            url = chunk.get("metadata", {}).get("source_url", "unknown")
-            text_hash = hash(chunk["text"]) & 0xFFFFFFFF
-            doc_id = f"{project_name}_{url}_{text_hash}_{i}"
+        for chunk, embedding in zip(chunks, embeddings):
+            metadata = chunk.get("metadata", {})
+            doc_id = chunk.get("id") or metadata.get("chunk_id")
+            if not doc_id:
+                identity = "\x1f".join([
+                    project_name,
+                    str(metadata.get("source_url", "")),
+                    chunk["text"],
+                ])
+                doc_id = f"chunk_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
 
             ids.append(doc_id)
             documents.append(chunk["text"])
-            metadatas.append(chunk.get("metadata", {}))
+            metadatas.append(self._metadata_for_chroma(metadata))
             embeds.append(embedding)
 
-        collection.add(
+        collection.upsert(
             ids=ids,
             documents=documents,
             metadatas=metadatas,
@@ -138,15 +195,17 @@ class VectorStore:
         )
 
         for proj in projects:
-            try:
-                collection = self._get_or_create_collection(proj)
-            except Exception:
+            collection = self._get_existing_collection(proj)
+            if collection is None:
+                continue
+            collection_count = collection.count()
+            if collection_count < 1:
                 continue
 
             where_filter = filter_metadata or None
             query_results = collection.query(
                 query_embeddings=[query_embedding],
-                n_results=top_k,
+                n_results=min(top_k, collection_count),
                 where=where_filter,
                 include=["documents", "metadatas", "distances"],
             )
@@ -177,11 +236,8 @@ class VectorStore:
     def count(self, project_name: Optional[str] = None) -> int:
         """统计文档数量。"""
         if project_name:
-            try:
-                collection = self._get_or_create_collection(project_name)
-                return collection.count()
-            except Exception:
-                return 0
+            collection = self._get_existing_collection(project_name)
+            return collection.count() if collection is not None else 0
         else:
             return sum(
                 self.count(proj) for proj in self._collections
@@ -190,3 +246,21 @@ class VectorStore:
     def list_projects(self) -> list[str]:
         """列出所有已索引的项目。"""
         return list(self._collections.keys())
+
+    def document_ids(self, project_name: str) -> set[str]:
+        """Return all persisted stable chunk IDs for one project."""
+        collection = self._get_existing_collection(project_name)
+        if collection is None or collection.count() < 1:
+            return set()
+        result = collection.get(include=[])
+        return set(result.get("ids", []))
+
+    def delete_documents(self, project_name: str, document_ids: set[str]) -> int:
+        """Delete selected stale chunks without dropping the project collection."""
+        if not document_ids:
+            return 0
+        collection = self._get_existing_collection(project_name)
+        if collection is None:
+            return 0
+        collection.delete(ids=sorted(document_ids))
+        return len(document_ids)

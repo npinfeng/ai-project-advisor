@@ -115,19 +115,33 @@ class HybridRetriever:
             索引统计信息
         """
         if not documents:
-            return {"chunks": 0, "indexed": 0}
+            self.clear(project_name)
+            return {
+                "chunks": 0,
+                "vector_indexed": 0,
+                "vector_removed": 0,
+                "vector_total": 0,
+                "bm25_indexed": 0,
+            }
 
         # 1. 分块
         chunks = self.chunker.chunk_documents(documents)
 
-        # 2. 批量嵌入
-        texts = [c["text"] for c in chunks]
-        embeddings = self.embedder.embed_batch(texts)
-
-        # 3. 存入向量存储
-        vector_count = self.vector_store.add_documents(
-            project_name, chunks, embeddings
-        )
+        # 2. 仅向量化新增 chunk，删除内容更新后遗留的旧 chunk。
+        expected_ids = {chunk["id"] for chunk in chunks}
+        existing_ids = self.vector_store.document_ids(project_name)
+        stale_ids = existing_ids - expected_ids
+        missing_chunks = [chunk for chunk in chunks if chunk["id"] not in existing_ids]
+        removed_count = self.vector_store.delete_documents(project_name, stale_ids)
+        if missing_chunks:
+            embeddings = self.embedder.embed_batch(
+                [chunk["text"] for chunk in missing_chunks]
+            )
+            vector_count = self.vector_store.add_documents(
+                project_name, missing_chunks, embeddings
+            )
+        else:
+            vector_count = 0
 
         # 4. 构建 BM25 索引
         self.bm25.index(project_name, chunks)
@@ -135,7 +149,9 @@ class HybridRetriever:
         return {
             "chunks": len(chunks),
             "vector_indexed": vector_count,
-            "bm25_indexed": self.bm25.count(),
+            "vector_removed": removed_count,
+            "vector_total": self.vector_store.count(project_name),
+            "bm25_indexed": self.bm25.count(project_name),
         }
 
     def search(

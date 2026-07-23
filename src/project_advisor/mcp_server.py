@@ -20,6 +20,14 @@ class CostEstimate(BaseModel):
     assumptions: list[str]
 
 
+class LicensePolicyResult(BaseModel):
+    license_id: str
+    risk: str
+    decision: str
+    reason: str
+    disclaimer: str
+
+
 @mcp.tool(structured_output=True)
 def estimate_llm_cost(
     monthly_requests: int = Field(ge=1, description="Expected requests per month"),
@@ -53,7 +61,7 @@ def check_license_policy(
     license_id: str = Field(description="SPDX-like license identifier, for example MIT or AGPL-3.0"),
     commercial_use: bool = Field(description="Whether the project will be used commercially"),
     closed_source_distribution: bool = Field(description="Whether modified software will be distributed as closed source"),
-) -> dict:
+) -> LicensePolicyResult:
     """Apply a conservative license-policy check for project shortlisting."""
     normalized = license_id.strip().upper()
     permissive = {"MIT", "APACHE-2.0", "BSD-2-CLAUSE", "BSD-3-CLAUSE", "ISC"}
@@ -72,13 +80,13 @@ def check_license_policy(
         decision = "legal_review_required"
         reason = "License policy is not covered by the deterministic allowlist."
 
-    return {
-        "license_id": normalized,
-        "risk": risk,
-        "decision": decision,
-        "reason": reason,
-        "disclaimer": "This engineering check is not legal advice.",
-    }
+    return LicensePolicyResult(
+        license_id=normalized,
+        risk=risk,
+        decision=decision,
+        reason=reason,
+        disclaimer="This engineering check is not legal advice.",
+    )
 
 
 def main() -> None:

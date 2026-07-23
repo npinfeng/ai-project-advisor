@@ -217,6 +217,7 @@ async def get_all_tools(config: RunnableConfig):
     )
     from project_advisor.tools.rag_search import (
         rag_ingest,
+        rag_rebuild,
         rag_search,
         rag_status,
     )
@@ -232,6 +233,7 @@ async def get_all_tools(config: RunnableConfig):
         batch_fetch_tool,
         rag_search,
         rag_ingest,
+        rag_rebuild,
         rag_status,
     ]
 

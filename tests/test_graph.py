@@ -271,6 +271,7 @@ def test_tools_registered():
         assert "batch_fetch_tool" in tool_names, f"Missing batch_fetch_tool, got: {tool_names}"
         assert "rag_search" in tool_names, f"Missing rag_search, got: {tool_names}"
         assert "rag_ingest" in tool_names, f"Missing rag_ingest, got: {tool_names}"
+        assert "rag_rebuild" in tool_names, f"Missing rag_rebuild, got: {tool_names}"
         assert "think_tool" in tool_names
         assert "github_get_repo" in tool_names
         print(f"All tools registered: {len(tools)} tools available")
@@ -315,7 +316,7 @@ def test_rag_modules():
         print(f"Batch chunker: {len(batch_chunks)} chunks")
 
         # 3. 测试 BM25（多文档索引后进行精确匹配）
-        bm25 = BM25Retriever()
+        bm25 = BM25Retriever(storage_dir=os.path.join(tmp_dir, "bm25"))
         # 添加更多文档以提高 BM25 的 IDF 质量
         chunks2 = chunker.chunk_document(
             "CrewAI is a framework for orchestrating AI agents with role-based collaboration. "

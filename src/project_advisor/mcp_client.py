@@ -1,5 +1,6 @@
 """MCP client configuration and LangChain tool loading."""
 
+import asyncio
 import json
 import logging
 import sys
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 _tool_cache: dict[str, list[BaseTool]] = {}
 _client_cache: dict[str, MultiServerMCPClient] = {}
+_connection_state: dict[str, dict[str, Any]] = {}
 
 
 def build_mcp_connections(config: Configuration) -> dict[str, dict[str, Any]]:
@@ -53,14 +55,29 @@ async def get_mcp_tools(
     if not force_refresh and cache_key in _tool_cache:
         return _tool_cache[cache_key]
 
+    _connection_state[cache_key] = {
+        "status": "connecting",
+        "server_count": len(connections),
+        "tool_count": 0,
+        "error_type": None,
+    }
     try:
         client = MultiServerMCPClient(
             connections,
             tool_name_prefix=True,
             handle_tool_errors=True,
         )
-        tools = await client.get_tools()
+        tools = await asyncio.wait_for(
+            client.get_tools(),
+            timeout=config.mcp_connect_timeout_seconds,
+        )
     except Exception as error:
+        _connection_state[cache_key] = {
+            "status": "degraded",
+            "server_count": len(connections),
+            "tool_count": 0,
+            "error_type": type(error).__name__,
+        }
         if config.mcp_required:
             raise RuntimeError("无法连接必需的 MCP Server。") from error
         logger.warning("MCP tools unavailable: %s", error)
@@ -68,10 +85,48 @@ async def get_mcp_tools(
 
     _client_cache[cache_key] = client
     _tool_cache[cache_key] = tools
+    _connection_state[cache_key] = {
+        "status": "connected",
+        "server_count": len(connections),
+        "tool_count": len(tools),
+        "error_type": None,
+    }
     return tools
+
+
+def get_mcp_diagnostics(config: Configuration) -> dict[str, Any]:
+    """Return non-secret MCP connection diagnostics without opening a connection."""
+    try:
+        connections = build_mcp_connections(config)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        return {
+            "status": "invalid_configuration",
+            "server_count": 0,
+            "tool_count": 0,
+            "error_type": type(error).__name__,
+        }
+    if not connections:
+        return {
+            "status": "disabled",
+            "server_count": 0,
+            "tool_count": 0,
+            "error_type": None,
+        }
+
+    cache_key = json.dumps(connections, ensure_ascii=False, sort_keys=True, default=str)
+    return _connection_state.get(
+        cache_key,
+        {
+            "status": "configured",
+            "server_count": len(connections),
+            "tool_count": len(_tool_cache.get(cache_key, [])),
+            "error_type": None,
+        },
+    ).copy()
 
 
 def clear_mcp_tool_cache() -> None:
     """Clear MCP client caches for tests and configuration reloads."""
     _tool_cache.clear()
     _client_cache.clear()
+    _connection_state.clear()

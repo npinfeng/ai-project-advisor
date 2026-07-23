@@ -54,8 +54,39 @@
           <span id="charCount">0 / 5000</span>
         </div>
 
-        <label for="candidates">候选项目 <span>可选，用逗号分隔</span></label>
-        <input id="candidates" name="candidates" value="LangGraph, CrewAI, Microsoft Agent Framework" placeholder="例如：LangGraph, CrewAI">
+        <fieldset class="candidate-mode" aria-labelledby="candidateModeLabel">
+          <legend id="candidateModeLabel">候选项目来源</legend>
+          <label class="mode-option">
+            <input type="radio" name="candidateMode" value="auto" checked>
+            <span><strong>AI 自动推荐</strong><small>根据你的需求生成候选项目和入选理由</small></span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="candidateMode" value="manual">
+            <span><strong>手动填写</strong><small>适合你已经有明确比较对象时</small></span>
+          </label>
+        </fieldset>
+
+        <p class="candidate-help" id="autoCandidateHelp">第一次提交只生成候选清单；确认、删除或补充后，才会开始深度评估。</p>
+        <div id="manualCandidateField" hidden>
+          <label for="candidates">候选项目 <span>用逗号分隔，最多 8 个</span></label>
+          <input id="candidates" name="candidates" placeholder="例如：LangGraph, CrewAI">
+        </div>
+
+        <section class="candidate-preview" id="candidatePreview" aria-labelledby="candidatePreviewTitle" hidden>
+          <div class="candidate-preview-heading">
+            <div>
+              <span class="eyebrow">CANDIDATE PREVIEW</span>
+              <h3 id="candidatePreviewTitle">请确认候选项目</h3>
+            </div>
+            <span id="candidatePreviewCount">0 个</span>
+          </div>
+          <p id="requirementsSummary"></p>
+          <div class="candidate-list" id="candidateList"></div>
+          <div class="candidate-add-row">
+            <input id="additionalCandidate" placeholder="补充一个候选项目名称" aria-label="补充候选项目">
+            <button type="button" id="addCandidateButton">添加</button>
+          </div>
+        </section>
 
         <div class="examples">
           <span>快速示例</span>
@@ -66,7 +97,7 @@
 
         <div class="form-actions">
           <button class="primary-button" id="submitButton" type="submit">
-            <span>开始深度评估</span>
+            <span id="submitButtonLabel">生成候选项目</span>
             <span class="button-arrow">→</span>
           </button>
           <button class="secondary-button" id="cancelButton" type="button" hidden>停止任务</button>
@@ -118,6 +149,31 @@
       </section>
     </section>
 
+    <section class="evaluation-panel" id="evaluationPanel" aria-labelledby="evaluationTitle">
+      <div class="evaluation-heading">
+        <div>
+          <span class="eyebrow">OFFLINE EVALUATION BASELINE</span>
+          <h2 id="evaluationTitle">系统评测看板</h2>
+          <p id="evaluationMeta">正在加载可复现的离线评测结果…</p>
+        </div>
+        <span class="panel-tag" id="evaluationState">LOADING</span>
+      </div>
+      <div class="metric-grid" id="evaluationMetrics">
+        <div class="metric-card"><span>Recall@K</span><strong data-eval="recall_at_k">—</strong></div>
+        <div class="metric-card"><span>Precision@K</span><strong data-eval="precision_at_k">—</strong></div>
+        <div class="metric-card"><span>MRR</span><strong data-eval="mrr">—</strong></div>
+        <div class="metric-card"><span>nDCG@K</span><strong data-eval="ndcg_at_k">—</strong></div>
+        <div class="metric-card"><span>引用准确率</span><strong data-eval="citation_accuracy">—</strong></div>
+        <div class="metric-card"><span>引用覆盖率</span><strong data-eval="citation_coverage">—</strong></div>
+        <div class="metric-card"><span>任务成功率</span><strong data-eval="task_success_rate">—</strong></div>
+        <div class="metric-card"><span>P50 延迟</span><strong data-eval="latency_p50_ms">—</strong></div>
+        <div class="metric-card"><span>P95 延迟</span><strong data-eval="latency_p95_ms">—</strong></div>
+        <div class="metric-card"><span>平均 Token</span><strong data-eval="average_tokens">—</strong></div>
+        <div class="metric-card"><span>平均成本</span><strong data-eval="average_cost_usd">—</strong></div>
+        <div class="metric-card"><span>评测 Case</span><strong data-eval="case_count">—</strong></div>
+      </div>
+    </section>
+
     <section class="results" id="results" hidden>
       <div class="results-heading">
         <div>
@@ -129,6 +185,24 @@
           <button class="text-button" id="downloadButton" type="button">下载 Markdown</button>
         </div>
       </div>
+      <section class="runtime-diagnostics" aria-labelledby="diagnosticsTitle">
+        <div class="diagnostics-heading">
+          <div>
+            <span class="eyebrow">RUN DIAGNOSTICS</span>
+            <h3 id="diagnosticsTitle">本次运行诊断</h3>
+          </div>
+          <span id="diagnosticsCollectionState">等待任务完成</span>
+        </div>
+        <div class="diagnostic-grid">
+          <div><span>总耗时</span><strong id="runtimeTotal">—</strong></div>
+          <div><span>候选项目</span><strong id="runtimeCandidates">—</strong></div>
+          <div><span>引用 URL</span><strong id="runtimeCitations">—</strong></div>
+          <div><span>MCP 状态 / 工具</span><strong id="runtimeMcp">—</strong></div>
+          <div><span>Token 用量</span><strong id="runtimeTokens">—</strong></div>
+          <div><span>成本估算</span><strong id="runtimeCost">—</strong></div>
+        </div>
+        <div class="stage-duration-list" id="stageDurations"></div>
+      </section>
       <div class="score-grid" id="scoreGrid"></div>
       <article class="report" id="report"></article>
     </section>

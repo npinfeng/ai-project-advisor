@@ -1,23 +1,30 @@
-"""工具模块 — GitHub API、搜索、评分引擎、引用验证、文档采集、RAG 搜索。"""
+"""Project Advisor tools exposed without eagerly importing RAG dependencies."""
 
-from project_advisor.tools.document_collector import (
-    batch_fetch_tool,
-    collect_documents,
-    fetch_webpage,
-    web_fetch_tool,
-)
-from project_advisor.tools.rag_search import (
-    rag_ingest,
-    rag_search,
-    rag_status,
-)
+from importlib import import_module
+from typing import Any
 
-__all__ = [
-    "fetch_webpage",
-    "web_fetch_tool",
-    "batch_fetch_tool",
-    "collect_documents",
-    "rag_search",
-    "rag_ingest",
-    "rag_status",
-]
+_EXPORTS = {
+    "fetch_webpage": ("project_advisor.tools.document_collector", "fetch_webpage"),
+    "web_fetch_tool": ("project_advisor.tools.document_collector", "web_fetch_tool"),
+    "batch_fetch_tool": ("project_advisor.tools.document_collector", "batch_fetch_tool"),
+    "collect_documents": (
+        "project_advisor.tools.document_collector",
+        "collect_documents",
+    ),
+    "rag_search": ("project_advisor.tools.rag_search", "rag_search"),
+    "rag_ingest": ("project_advisor.tools.rag_search", "rag_ingest"),
+    "rag_rebuild": ("project_advisor.tools.rag_search", "rag_rebuild"),
+    "rag_status": ("project_advisor.tools.rag_search", "rag_status"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Load each tool only when its package-level attribute is requested."""
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute_name = _EXPORTS[name]
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value

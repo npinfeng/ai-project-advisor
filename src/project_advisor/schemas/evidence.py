@@ -3,10 +3,11 @@
 所有结构化输出和证据模型集中在此模块，供 Agent、工具和 Graph 共同使用。
 """
 
+import hashlib
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ===== 需求模型 =====
@@ -107,11 +108,29 @@ class CandidateProject(BaseModel):
     )
 
 
+class CandidateRecommendation(BaseModel):
+    """Planner 推荐的候选项目及其入选理由。"""
+
+    name: str = Field(min_length=1, description="Candidate project name.")
+    github_url: Optional[str] = Field(
+        default=None,
+        description="Canonical GitHub repository URL when known.",
+    )
+    reason: str = Field(
+        min_length=1,
+        description="Why this candidate matches the user's requirements.",
+    )
+
+
 # ===== 证据模型 =====
 
 class Evidence(BaseModel):
     """统一证据对象 — 所有研究发现的标准表示。"""
 
+    evidence_id: str = Field(
+        default="",
+        description="Stable evidence identifier derived from source and content.",
+    )
     source_url: str = Field(description="URL of the evidence source.")
     source_type: str = Field(
         description="Source type: 'github', 'official_documentation', 'blog', 'community', 'release_note', 'issue'.",
@@ -131,6 +150,16 @@ class Evidence(BaseModel):
     version_info: Optional[str] = Field(
         default=None, description="Document or software version at time of retrieval."
     )
+
+    @model_validator(mode="after")
+    def populate_evidence_id(self) -> "Evidence":
+        """Generate a deterministic ID while preserving explicitly supplied IDs."""
+        if not self.evidence_id:
+            payload = "\x1f".join(
+                [self.source_url, self.project_name, self.relevance, self.content]
+            )
+            self.evidence_id = f"ev_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]}"
+        return self
 
 
 # ===== 评估模型 =====
@@ -175,6 +204,18 @@ class ProjectScore(BaseModel):
     weighted_total: float = Field(default=0.0, description="Final weighted total score.")
     justification: str = Field(
         default="", description="Brief justification for the scores."
+    )
+    evidence_ids: list[str] = Field(
+        default_factory=list,
+        description="Validated evidence IDs supporting this project score.",
+    )
+    source_urls: list[str] = Field(
+        default_factory=list,
+        description="Validated source URLs supporting this project score.",
+    )
+    evidence_confidence: str = Field(
+        default="low",
+        description="Evidence confidence: high, medium, low, or insufficient.",
     )
 
 

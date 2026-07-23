@@ -9,7 +9,9 @@
 """
 
 import json
+import hashlib
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -33,14 +35,17 @@ class DocumentStore:
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self._index: dict[str, list[dict]] = {}  # project_name → list of doc dicts
-        self._url_index: set[str] = set()  # 去重用的 URL 集合
+        self._evidence_index: set[str] = set()
+        self._project_files: dict[str, set[Path]] = {}
         self._load_all()
 
     def _get_project_file(self, project_name: str) -> Path:
         """获取项目的文档文件路径。"""
-        # 安全处理项目名称
-        safe_name = "".join(c for c in project_name if c.isalnum() or c in "_-")
-        return self.storage_dir / f"{safe_name}.json"
+        safe_name = "".join(
+            c if c.isalnum() or c in "_-" else "_" for c in project_name
+        ).strip("_") or "project"
+        digest = hashlib.sha256(project_name.encode("utf-8")).hexdigest()[:10]
+        return self.storage_dir / f"{safe_name[:60]}_{digest}.json"
 
     def _load_all(self):
         """加载所有已存储的文档。"""
@@ -51,19 +56,42 @@ class DocumentStore:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     docs = json.load(f)
-                    project = file_path.stem
-                    self._index[project] = docs
                     for doc in docs:
-                        self._url_index.add(doc.get("source_url", ""))
+                        try:
+                            evidence = Evidence.model_validate(doc)
+                        except (TypeError, ValueError):
+                            continue
+                        project = evidence.project_name
+                        if evidence.evidence_id in self._evidence_index:
+                            continue
+                        normalized = {
+                            **evidence.model_dump(),
+                            "stored_at": doc.get("stored_at", evidence.retrieved_at),
+                        }
+                        self._index.setdefault(project, []).append(normalized)
+                        self._project_files.setdefault(project, set()).add(file_path)
+                        self._evidence_index.add(evidence.evidence_id)
             except (json.JSONDecodeError, IOError):
                 continue
 
     def _save_project(self, project_name: str):
         """保存项目文档到文件。"""
         file_path = self._get_project_file(project_name)
-        docs = self._index.get(project_name, [])
-        with open(file_path, "w", encoding="utf-8") as f:
+        docs = sorted(
+            self._index.get(project_name, []),
+            key=lambda item: item.get("retrieved_at", item.get("stored_at", "")),
+            reverse=True,
+        )
+        temporary_path = file_path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        with open(temporary_path, "w", encoding="utf-8") as f:
             json.dump(docs, f, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, file_path)
+        for legacy_path in self._project_files.get(project_name, set()) - {file_path}:
+            if legacy_path.exists():
+                legacy_path.unlink()
+        self._project_files[project_name] = {file_path}
 
     def add(self, evidence: Evidence) -> bool:
         """添加一条 Evidence 到存储。自动去重。
@@ -74,8 +102,7 @@ class DocumentStore:
         Returns:
             如果新增返回 True，如果已存在返回 False
         """
-        # URL 去重
-        if evidence.source_url in self._url_index:
+        if evidence.evidence_id in self._evidence_index:
             return False
 
         doc_dict = evidence.model_dump()
@@ -86,7 +113,7 @@ class DocumentStore:
             self._index[project] = []
 
         self._index[project].append(doc_dict)
-        self._url_index.add(evidence.source_url)
+        self._evidence_index.add(evidence.evidence_id)
         self._save_project(project)
         return True
 
@@ -97,9 +124,18 @@ class DocumentStore:
             新增的文档数量
         """
         count = 0
+        changed_projects: set[str] = set()
         for ev in evidences:
-            if self.add(ev):
-                count += 1
+            if ev.evidence_id in self._evidence_index:
+                continue
+            doc_dict = ev.model_dump()
+            doc_dict["stored_at"] = datetime.now().isoformat()
+            self._index.setdefault(ev.project_name, []).append(doc_dict)
+            self._evidence_index.add(ev.evidence_id)
+            changed_projects.add(ev.project_name)
+            count += 1
+        for project_name in changed_projects:
+            self._save_project(project_name)
         return count
 
     def get_by_project(
@@ -125,19 +161,7 @@ class DocumentStore:
 
         docs = docs[:max_results]
 
-        return [
-            Evidence(
-                source_url=d["source_url"],
-                source_type=d.get("source_type", "unknown"),
-                project_name=d["project_name"],
-                content=d.get("content", ""),
-                relevance=d.get("relevance", ""),
-                confidence=d.get("confidence", "medium"),
-                retrieved_at=d.get("retrieved_at", ""),
-                version_info=d.get("version_info"),
-            )
-            for d in docs
-        ]
+        return [Evidence.model_validate(d) for d in docs]
 
     def search(
         self,
@@ -167,19 +191,9 @@ class DocumentStore:
                 content = doc.get("content", "").lower()
                 title = doc.get("source_url", "").lower()
                 if query_lower in content or query_lower in title:
-                    results.append(
-                        Evidence(
-                            source_url=doc["source_url"],
-                            source_type=doc.get("source_type", "unknown"),
-                            project_name=proj,
-                            content=doc.get("content", ""),
-                            relevance=doc.get("relevance", ""),
-                            confidence=doc.get("confidence", "medium"),
-                            retrieved_at=doc.get("retrieved_at", ""),
-                            version_info=doc.get("version_info"),
-                        )
-                    )
+                    results.append(Evidence.model_validate(doc))
 
+        results.sort(key=lambda item: item.retrieved_at, reverse=True)
         return results[:max_results]
 
     def get_stats(self) -> dict:
@@ -198,8 +212,11 @@ class DocumentStore:
         """清除指定项目的所有文档。"""
         if project_name in self._index:
             for doc in self._index[project_name]:
-                self._url_index.discard(doc.get("source_url", ""))
+                self._evidence_index.discard(doc.get("evidence_id", ""))
             del self._index[project_name]
-            file_path = self._get_project_file(project_name)
-            if file_path.exists():
-                file_path.unlink()
+            project_files = self._project_files.pop(
+                project_name, {self._get_project_file(project_name)}
+            )
+            for file_path in project_files:
+                if file_path.exists():
+                    file_path.unlink()

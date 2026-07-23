@@ -8,12 +8,14 @@ Reviewer 是技术选型流程的最后一个核心 Agent，负责：
 5. 生成结构化的技术选型报告
 """
 
+import json
+
 from langchain_core.messages import HumanMessage, SystemMessage, get_buffer_string
 from langchain_core.runnables import RunnableConfig
 
 from project_advisor.configuration import Configuration
 from project_advisor.prompts import final_report_template, reviewer_system_prompt
-from project_advisor.schemas.evidence import ReviewResult
+from project_advisor.schemas.evidence import Evidence, ProjectScore, ReviewResult
 from project_advisor.state import AgentState
 from project_advisor.tools.citations import detect_conflicts
 from project_advisor.tools.scoring import (
@@ -22,6 +24,77 @@ from project_advisor.tools.scoring import (
     format_score_table,
 )
 from project_advisor.utils import create_chat_model, get_today_str
+
+
+def _normalize_evidences(values: list) -> list[Evidence]:
+    """Validate and de-duplicate evidence carried through graph state."""
+    evidences: list[Evidence] = []
+    seen: set[str] = set()
+    for value in values:
+        try:
+            evidence = value if isinstance(value, Evidence) else Evidence.model_validate(value)
+        except (TypeError, ValueError):
+            continue
+        if evidence.evidence_id not in seen:
+            seen.add(evidence.evidence_id)
+            evidences.append(evidence)
+    return evidences
+
+
+def _evidence_for_project(project_name: str, evidences: list[Evidence]) -> list[Evidence]:
+    target = project_name.casefold().strip()
+    return [
+        evidence
+        for evidence in evidences
+        if target == evidence.project_name.casefold().strip()
+        or target in evidence.project_name.casefold()
+    ]
+
+
+def _bind_scores_to_evidence(
+    scores: list[ProjectScore],
+    candidates: list[str],
+    evidences: list[Evidence],
+) -> tuple[list[ProjectScore], list[str]]:
+    """Force one score per confirmed candidate and only attach validated references."""
+    score_map = {score.project_name.casefold(): score for score in scores}
+    bound_scores: list[ProjectScore] = []
+    gaps: list[str] = []
+
+    for candidate in candidates:
+        score = score_map.get(candidate.casefold())
+        if score is None:
+            score = ProjectScore(
+                project_name=candidate,
+                justification="Reviewer 未返回该候选项目的结构化评分。",
+            )
+            gaps.append(f"{candidate} 缺少结构化评分。")
+
+        matched = _evidence_for_project(candidate, evidences)
+        evidence_ids = [evidence.evidence_id for evidence in matched]
+        source_urls = list(dict.fromkeys(evidence.source_url for evidence in matched))
+        source_types = {evidence.source_type for evidence in matched}
+        if len(matched) >= 3 and len(source_types) >= 2:
+            confidence = "high"
+        elif len(matched) >= 2:
+            confidence = "medium"
+        elif matched:
+            confidence = "low"
+        else:
+            confidence = "insufficient"
+            gaps.append(f"{candidate} 没有可追溯到该项目的结构化证据。")
+
+        bound_scores.append(
+            score.model_copy(
+                update={
+                    "project_name": candidate,
+                    "evidence_ids": evidence_ids,
+                    "source_urls": source_urls,
+                    "evidence_confidence": confidence,
+                }
+            )
+        )
+    return bound_scores, gaps
 
 
 async def review_and_score(state: AgentState, config: RunnableConfig):
@@ -36,6 +109,14 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
     findings = "\n\n".join(notes) if notes else "暂无研究发现。"
     candidates = state.get("candidates", [])
     research_brief = state.get("research_brief", "")
+    evidences = _normalize_evidences(state.get("evidences", []))
+    evidence_payload = [
+        {
+            **evidence.model_dump(exclude={"content"}),
+            "content": evidence.content[:1800],
+        }
+        for evidence in evidences[:80]
+    ]
 
     configurable = Configuration.from_runnable_config(config)
 
@@ -55,8 +136,13 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
 {findings}
 </研究发现>
 
+<结构化证据>
+{json.dumps(evidence_payload, ensure_ascii=False, indent=2) if evidence_payload else '暂无结构化证据'}
+</结构化证据>
+
 请对每个候选项目分析其优势、劣势和风险。提供评分建议（1-10 分/每维度）。
-同时指出证据不足的地方和来源冲突之处。"""
+评分只能依据上面的结构化证据，不得编造 evidence_id 或来源 URL。
+证据不足时应保守评分，并明确指出证据缺口和来源冲突。"""
 
     reviewer = (
         create_chat_model(
@@ -82,9 +168,13 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
         "weight_deployment_cost": configurable.weight_deployment_cost,
     }
     criteria = create_criteria_from_config(weights)
-    ranked_scores = compare_projects(response.scores, criteria)
+    bound_scores, binding_gaps = _bind_scores_to_evidence(
+        response.scores, candidates, evidences
+    )
+    ranked_scores = compare_projects(bound_scores, criteria)
     score_table = format_score_table(ranked_scores)
-    evidence_gaps = "\n".join(f"- {gap}" for gap in response.evidence_gaps)
+    all_gaps = list(dict.fromkeys([*response.evidence_gaps, *binding_gaps]))
+    evidence_gaps = "\n".join(f"- {gap}" for gap in all_gaps)
     review_note = f"=== Reviewer 分析 ===\n{response.analysis}\n\n{score_table}"
     if evidence_gaps:
         review_note += f"\n\n=== 证据缺口 ===\n{evidence_gaps}"
@@ -109,6 +199,7 @@ async def generate_report(state: AgentState, config: RunnableConfig):
     candidates = state.get("candidates", [])
     research_brief = state.get("research_brief", "")
     scores = state.get("scores", [])
+    evidences = _normalize_evidences(state.get("evidences", []))
     score_table = format_score_table(scores) if scores else "暂无结构化评分。"
     findings = f"{findings}\n\n=== 程序计算的结构化评分 ===\n{score_table}"
 
@@ -140,6 +231,9 @@ async def generate_report(state: AgentState, config: RunnableConfig):
                     f"- **扩展能力**：{score.extensibility}/10\n"
                     f"- **部署和运行成本**：{score.deployment_cost}/10\n"
                     f"- **加权总分**：{score.weighted_total}/10\n"
+                    f"- **证据置信度**：{score.evidence_confidence}\n"
+                    f"- **证据 ID**：{', '.join(score.evidence_ids) or '无'}\n"
+                    f"- **来源 URL**：{', '.join(score.source_urls) or '无'}\n"
                     f"- **评分依据**：{score.justification}\n"
                 )
             else:
@@ -172,12 +266,8 @@ async def generate_report(state: AgentState, config: RunnableConfig):
         report_content = f"报告生成失败：{str(e)}\n\n=== 原始研究发现 ===\n\n{findings}"
 
     # 检查冲突
-    from project_advisor.schemas.evidence import Evidence
-    evidences = state.get("evidences", [])
-    if isinstance(evidences, list) and evidences:
-        conflicts = detect_conflicts([
-            e for e in evidences if isinstance(e, Evidence)
-        ])
+    if evidences:
+        conflicts = detect_conflicts(evidences)
         if conflicts:
             conflict_text = "\n".join([
                 f"- **{c['type']}**：{c.get('detail', '')}" for c in conflicts

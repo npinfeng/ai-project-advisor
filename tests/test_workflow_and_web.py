@@ -9,7 +9,16 @@ from project_advisor.graph import (
     researcher_subgraph_repo,
     supervisor_subgraph,
 )
-from project_advisor.schemas.evidence import ProjectScore, ReviewResult
+from project_advisor.agents.reviewer import _bind_scores_to_evidence
+from project_advisor.schemas.evidence import (
+    CandidateRecommendation,
+    Evidence,
+    ProjectScore,
+    Requirements,
+    ReviewResult,
+)
+from project_advisor.state import ResearchPlan
+from project_advisor.tools.evidence_factory import build_evidences_from_tool_result
 
 
 def test_research_subgraphs_have_execution_loops():
@@ -45,6 +54,28 @@ def test_review_result_is_structured():
 
     assert result.scores[0].project_name == "LangGraph"
     assert result.evidence_gaps
+
+
+def test_tool_output_is_normalized_and_score_is_bound_to_evidence():
+    evidences = build_evidences_from_tool_result(
+        tool_name="github_get_repo",
+        args={"github_url": "https://github.com/langchain-ai/langgraph"},
+        result={"stars": 100, "url": "https://github.com/langchain-ai/langgraph"},
+        project_name="LangGraph",
+        research_topic="维护状态",
+    )
+    scores, gaps = _bind_scores_to_evidence(
+        [ProjectScore(project_name="LangGraph", feature_match=9)],
+        ["LangGraph", "CrewAI"],
+        evidences,
+    )
+
+    assert evidences[0].evidence_id.startswith("ev_")
+    assert scores[0].evidence_ids == [evidences[0].evidence_id]
+    assert scores[0].source_urls == ["https://github.com/langchain-ai/langgraph"]
+    assert scores[1].project_name == "CrewAI"
+    assert scores[1].evidence_confidence == "insufficient"
+    assert gaps
 
 
 class FakeGraph:
@@ -85,6 +116,15 @@ def test_web_app_and_sse_stream(monkeypatch):
     assert page_response.status_code == 200
     assert "Project Advisor" in page_response.text
     assert "开始深度评估" in page_response.text
+    assert "系统评测看板" in page_response.text
+    assert "本次运行诊断" in page_response.text
+
+    evaluation_response = client.get("/api/evaluation")
+    assert evaluation_response.status_code == 200
+    evaluation_payload = evaluation_response.json()
+    assert evaluation_payload["source"] == "real_results.json"
+    assert evaluation_payload["report"]["case_count"] == 10
+    assert evaluation_payload["report"]["latency_p95_ms"] >= evaluation_payload["report"]["latency_p50_ms"]
 
     with client.stream(
         "POST",
@@ -102,3 +142,50 @@ def test_web_app_and_sse_stream(monkeypatch):
     assert "event: result" in body
     assert "# Test report" in body
     assert "8.15" in body
+    assert '"candidate_count": 1' in body
+    assert '"stage_duration_ms"' in body
+    assert '"stage_durations_ms"' in body
+    assert '"token_usage"' in body
+
+
+def test_candidate_suggestion_preview(monkeypatch):
+    app_module = importlib.import_module("project_advisor.app")
+    plan = ResearchPlan(
+        research_brief="评估 Python Agent 框架。",
+        requirements=Requirements(
+            language="Python",
+            required_features=["multi_agent", "self_hosted"],
+        ),
+        candidates=[
+            CandidateRecommendation(
+                name="LangGraph",
+                github_url="https://github.com/langchain-ai/langgraph",
+                reason="状态管理和持久化能力匹配。",
+            ),
+            CandidateRecommendation(
+                name="CrewAI",
+                github_url="https://github.com/crewAIInc/crewAI",
+                reason="多智能体角色协作开箱即用。",
+            ),
+        ],
+        evaluation_focus=["工程可靠性", "学习成本"],
+    )
+
+    async def fake_generate_candidate_plan(question):
+        assert "Python" in question
+        return plan
+
+    monkeypatch.setattr(
+        app_module, "_generate_candidate_plan", fake_generate_candidate_plan
+    )
+    client = TestClient(app_module.app)
+    response = client.post(
+        "/api/candidates/suggest",
+        json={"question": "请推荐适合 Python 多智能体应用的开源框架。"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["requirements"]["language"] == "Python"
+    assert len(payload["candidates"]) == 2
+    assert payload["candidates"][0]["reason"]

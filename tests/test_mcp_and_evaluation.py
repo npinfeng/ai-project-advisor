@@ -7,8 +7,17 @@ from pathlib import Path
 import pytest
 
 from project_advisor.configuration import Configuration
-from project_advisor.evaluation import EvaluationCase, evaluate_cases, evaluate_file
-from project_advisor.mcp_client import clear_mcp_tool_cache, get_mcp_tools
+from project_advisor.evaluation import (
+    EvaluationCase,
+    evaluate_cases,
+    evaluate_file,
+    load_evaluation_file,
+)
+from project_advisor.mcp_client import (
+    clear_mcp_tool_cache,
+    get_mcp_diagnostics,
+    get_mcp_tools,
+)
 
 
 def test_offline_evaluation_metrics():
@@ -48,6 +57,29 @@ def test_sample_evaluation_file():
     assert report.latency_p95_ms >= report.latency_p50_ms
 
 
+def test_extended_evaluation_file():
+    extended = Path(__file__).parents[1] / "evals" / "real_results.json"
+    cases, k = load_evaluation_file(extended)
+    report = evaluate_file(extended)
+
+    assert len(cases) == 10
+    assert len({case.case_id for case in cases}) == 10
+    assert k == 5
+    assert report.case_count == 10
+    assert 0 <= report.task_success_rate <= 1
+
+
+def test_mcp_diagnostics_when_disabled():
+    diagnostics = get_mcp_diagnostics(Configuration(enable_local_mcp=False))
+
+    assert diagnostics == {
+        "status": "disabled",
+        "server_count": 0,
+        "tool_count": 0,
+        "error_type": None,
+    }
+
+
 def test_real_stdio_mcp_tool_call():
     async def run():
         clear_mcp_tool_cache()
@@ -62,8 +94,16 @@ def test_real_stdio_mcp_tool_call():
                 "output_price_per_million": 2.0,
             }
         )
-        payload = json.loads(result) if isinstance(result, str) else result
+        if isinstance(result, str):
+            payload = json.loads(result)
+        elif isinstance(result, list):
+            payload = json.loads(result[0]["text"])
+        else:
+            payload = result
         assert payload["monthly_cost_usd"] == pytest.approx(3.0)
         assert payload["monthly_input_tokens"] == 2_000_000
+        diagnostics = get_mcp_diagnostics(Configuration())
+        assert diagnostics["status"] == "connected"
+        assert diagnostics["tool_count"] == 2
 
     asyncio.run(run())

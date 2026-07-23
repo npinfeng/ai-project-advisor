@@ -92,6 +92,23 @@ class Configuration(BaseModel):
         default=False,
         description="MCP 连接失败时是否中断工作流",
     )
+    mcp_connect_timeout_seconds: float = Field(
+        default=20.0,
+        gt=0,
+        description="MCP 工具发现超时时间（秒）",
+    )
+
+    # ===== 运行诊断配置 =====
+    input_price_per_million: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="诊断面板使用的输入 Token 单价（USD / 1M Token）",
+    )
+    output_price_per_million: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="诊断面板使用的输出 Token 单价（USD / 1M Token）",
+    )
 
     # ===== 评分权重配置 =====
     weight_feature_match: float = Field(default=0.30, ge=0.0, le=1.0)
