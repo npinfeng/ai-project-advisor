@@ -21,16 +21,121 @@ from project_advisor.state import (
 from project_advisor.utils import create_chat_model, get_today_str
 
 
+def _count_clarification_rounds(messages: list) -> int:
+    """从对话历史中推导已进行的追问轮数。
+
+    通过统计 Assistant 发出的追问消息数量来计算，
+    这样可以在多次 API 调用之间保持追问轮数的连续性。
+    """
+    count = 0
+    for msg in messages:
+        content = ""
+        if hasattr(msg, "content"):
+            content = str(msg.content or "")
+        elif isinstance(msg, dict):
+            content = str(msg.get("content", ""))
+        # 检测追问特征：包含"需要了解更多"或"请补充"等追问关键词
+        if any(
+            keyword in content
+            for keyword in [
+                "需要了解更多",
+                "请补充",
+                "能详细说明",
+                "具体是",
+                "能否确认",
+                "澄清",
+                "clarify",
+                "你是想要",
+                "哪种",
+                "哪些",
+            ]
+        ):
+            count += 1
+    return count
+
+
 async def clarify_requirements(state: AgentState, config: RunnableConfig):
-    """Deterministically require a confirmed plan or candidate list."""
-    if not state.get("confirmed_plan") and not state.get("confirmed_candidates"):
+    """多轮诊断式需求澄清。
+
+    支持最多 max_clarification_rounds 轮迭代追问。
+    每轮由 Planner LLM 诊断当前信息的充分性，
+    提出针对性的追问（而非 checklist 式填表），
+    直到关键硬约束都明确后才进入评估计划阶段。
+
+    追问轮数从对话历史中自动推导，跨 API 调用保持连续。
+    """
+    # 如果已经有确认的计划或候选项目，跳过追问
+    if state.get("confirmed_plan") or state.get("confirmed_candidates"):
+        return {"next": "plan_evaluation"}
+
+    configurable = Configuration.from_runnable_config(config)
+    if not configurable.allow_clarification:
+        return {"next": "plan_evaluation"}
+
+    from langchain_core.messages import get_buffer_string
+
+    from project_advisor.prompts import clarify_with_user_instructions
+    from project_advisor.utils import create_chat_model, get_today_str
+
+    messages = state.get("messages", [])
+    # 从对话历史推导追问轮数（跨调用持久）
+    clarification_round = _count_clarification_rounds(messages)
+    max_rounds = state.get("max_clarification_rounds", 3)
+
+    prompt = clarify_with_user_instructions.format(
+        messages=get_buffer_string(messages),
+        date=get_today_str(),
+        round_number=clarification_round,
+        max_rounds=max_rounds,
+    )
+
+    clarify_model = (
+        create_chat_model(
+            configurable.research_model,
+            max_tokens=configurable.research_model_max_tokens,
+        )
+        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+    )
+
+    response = await clarify_model.ainvoke([HumanMessage(content=prompt)])
+
+    # 尝试以 JSON 解析回复
+    import json
+    import re
+    need_clarification = False
+    question = ""
+    verification = ""
+
+    try:
+        content = response.content if hasattr(response, "content") else str(response)
+        # 提取 JSON 块
+        json_match = re.search(r'\{[^{}]*"need_clarification"[^{}]*\}', content)
+        if json_match:
+            parsed = json.loads(json_match.group())
+            need_clarification = parsed.get("need_clarification", False)
+            question = parsed.get("question", "")
+            verification = parsed.get("verification", "")
+    except (json.JSONDecodeError, AttributeError):
+        # 如果 JSON 解析失败，检查回复中是否包含问号（暗示在追问）
+        content = response.content if hasattr(response, "content") else str(response)
+        if "?" in content and len(content) < 500:
+            need_clarification = True
+            question = content
+
+    if need_clarification and clarification_round < max_rounds:
         return {
-            "messages": [AIMessage(
-                content="请先生成并确认候选项目，或在请求中提供候选项目列表。"
-            )],
+            "messages": [AIMessage(content=question)],
+            "clarification_round": clarification_round + 1,
             "next": "__end__",
         }
-    return {"next": "plan_evaluation"}
+
+    # 不需要追问或已达最大轮数，确认并继续
+    confirm_msg = verification or "需求已确认，开始评估。"
+    return {
+        "messages": [AIMessage(content=confirm_msg)],
+        "clarification_round": clarification_round + 1,
+        "next": "plan_evaluation",
+    }
 
 
 async def generate_research_plan(
@@ -113,6 +218,8 @@ def build_research_tasks(
             if requested_tracks is not None
             else {"repository", "documentation"}
         )
+        # 没有 GitHub URL 的项目仍然创建仓库任务，
+        # 研究员可以在没有 GitHub URL 的情况下使用备用搜索策略
         if "repository" in allowed_tracks:
             github_reference = candidate.github_url or "未提供；不得猜测仓库地址"
             tasks.append(ResearchTask(

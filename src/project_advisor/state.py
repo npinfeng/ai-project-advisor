@@ -95,6 +95,10 @@ class AgentState(MessagesState):
     # 流程控制
     next: str = ""
 
+    # 多轮追问
+    clarification_round: int = 0
+    max_clarification_rounds: int = 3
+
     # 需求解析阶段
     requirements: Optional[Requirements] = None
     candidates: list[str] = []

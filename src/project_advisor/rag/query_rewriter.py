@@ -29,7 +29,7 @@ class QueryRewriter:
     支持生成多角度子查询以覆盖不同评估维度。
     """
 
-    def __init__(self, model_name: str = "deepseek:deepseek-chat"):
+    def __init__(self, model_name: str = "deepseek:deepseek-v4-flash"):
         """初始化查询改写器。
 
         Args:

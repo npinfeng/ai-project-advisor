@@ -110,7 +110,12 @@ class DocumentChunker:
         for index, chunk in enumerate(chunks):
             source_url = str(metadata.get("source_url", ""))
             project_name = str(metadata.get("project_name", ""))
-            identity = "\x1f".join([project_name, source_url, chunk])
+            identity = "\x1f".join([
+                project_name,
+                source_url,
+                str(metadata.get("evidence_id", "")),
+                chunk,
+            ])
             chunk_id = f"chunk_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
             chunk_metadata = {
                 **metadata,

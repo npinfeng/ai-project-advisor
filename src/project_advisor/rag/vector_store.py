@@ -66,9 +66,13 @@ class VectorStore:
 
     def _get_collection_name(self, project_name: str) -> str:
         """获取项目的 Collection 名称。"""
-        safe_name = "".join(
-            c if c.isalnum() or c in "_-" else "_" for c in project_name
-        )
+        # ChromaDB 只允许 [a-zA-Z0-9._-]，首尾必须是 [a-zA-Z0-9]
+        import re
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", project_name)
+        safe_name = re.sub(r"_+", "_", safe_name).strip("_.")
+        if not safe_name or len(safe_name) < 3:
+            import hashlib
+            safe_name = f"project_{hashlib.sha256(project_name.encode()).hexdigest()[:16]}"
         return f"{self.collection_prefix}_{safe_name}"
 
     def _get_or_create_collection(

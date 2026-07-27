@@ -15,6 +15,11 @@ _EXPORTS = {
     "rag_ingest": ("project_advisor.tools.rag_search", "rag_ingest"),
     "rag_rebuild": ("project_advisor.tools.rag_search", "rag_rebuild"),
     "rag_status": ("project_advisor.tools.rag_search", "rag_status"),
+    "model_info": ("project_advisor.tools.model_registry", "model_info"),
+    "check_local_feasibility": (
+        "project_advisor.tools.model_registry",
+        "check_local_feasibility",
+    ),
 }
 
 __all__ = list(_EXPORTS)

@@ -63,6 +63,7 @@ def create_chat_model(
             base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             max_tokens=max_tokens,
+            extra_body={"thinking": {"type": "disabled"}},
         )
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
@@ -277,6 +278,7 @@ async def get_documentation_tools(config: RunnableConfig) -> list[Any]:
         web_fetch_tool,
     )
     from project_advisor.tools.rag_search import rag_search
+    from project_advisor.tools.model_registry import model_info
 
     tools = [
         think_tool,
@@ -284,6 +286,7 @@ async def get_documentation_tools(config: RunnableConfig) -> list[Any]:
         web_fetch_tool,
         batch_fetch_tool,
         rag_search,
+        model_info,
     ]
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))

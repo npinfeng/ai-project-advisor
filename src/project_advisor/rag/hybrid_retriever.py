@@ -1,14 +1,16 @@
-"""混合检索引擎 — BM25 + 向量检索 + Reciprocal Rank Fusion。
+"""混合检索引擎 — BM25 + 向量检索 + Reciprocal Rank Fusion + 时间衰减。
 
 核心思路：
 1. 同时执行 BM25 关键词检索和向量语义检索
-2. 使用 RRF 算法融合两路结果
+2. 使用 RRF 算法融合两路结果（含时间衰减因子）
 3. 对融合后的候选文档进行重排序
-4. 支持元数据过滤（项目、文档类型、日期）
+4. 支持元数据过滤（项目、文档类型、日期、新鲜度）
 
 这是整个 RAG 系统的主要对外接口。
 """
 
+import math
+from datetime import datetime, timezone
 from typing import Optional
 
 from project_advisor.rag.bm25_retriever import BM25Retriever
@@ -16,21 +18,60 @@ from project_advisor.rag.chunker import DocumentChunker
 from project_advisor.rag.embedder import Embedder
 from project_advisor.rag.vector_store import VectorStore
 
+# 时间衰减半衰期（天）：超过此天数的文档 RRF 得分衰减至一半
+TIME_DECAY_HALF_LIFE_DAYS = 90
+
+
+def _compute_time_decay(
+    retrieved_at: Optional[str],
+    half_life_days: float = TIME_DECAY_HALF_LIFE_DAYS,
+) -> float:
+    """根据文档检索时间计算新鲜度衰减因子。
+
+    公式：decay = 0.5 ^ (age_days / half_life_days)
+    - 今天检索的文档：decay = 1.0
+    - N 天前检索的文档：decay = 0.5 ^ (N / half_life)
+    - 无法解析时间的文档：decay = 0.5（保守降权）
+
+    Args:
+        retrieved_at: ISO 格式的检索时间字符串
+        half_life_days: 半衰期天数
+
+    Returns:
+        0.0~1.0 之间的衰减因子
+    """
+    if not retrieved_at:
+        return 0.5
+    try:
+        retrieved_dt = datetime.fromisoformat(retrieved_at)
+        now = datetime.now(timezone.utc)
+        if retrieved_dt.tzinfo is None:
+            retrieved_dt = retrieved_dt.replace(tzinfo=timezone.utc)
+        age_days = (now - retrieved_dt).total_seconds() / 86400.0
+        if age_days <= 0:
+            return 1.0
+        return math.pow(0.5, age_days / half_life_days)
+    except (ValueError, TypeError):
+        return 0.5
+
 
 def reciprocal_rank_fusion(
     result_lists: list[list[dict]],
     k: int = 60,
     weight_vector: Optional[list[float]] = None,
+    enable_time_decay: bool = True,
 ) -> list[dict]:
-    """Reciprocal Rank Fusion（RRF）— 融合多路检索结果。
+    """Reciprocal Rank Fusion（RRF）— 融合多路检索结果（含时间衰减）。
 
-    公式：score(d) = sum(1 / (k + rank_i(d)))
+    公式：score(d) = sum(w_i / (k + rank_i(d))) * time_decay(d)
     其中 k 是平滑参数（默认 60），rank_i 是文档在第 i 路结果中的排名。
+    time_decay(d) 根据文档的 retrieved_at 计算新鲜度惩罚。
 
     Args:
         result_lists: 多路检索结果列表
         k: RRF 平滑参数
         weight_vector: 各路结果的权重，如 [0.6, 0.4] 表示向量检索权重更高
+        enable_time_decay: 是否启用时间衰减
 
     Returns:
         按 RRF 分数降序排列的融合结果
@@ -54,6 +95,18 @@ def reciprocal_rank_fusion(
                     "rrf_score": 0.0,
                 }
             scores[doc_id]["rrf_score"] += weight / (k + rank)
+
+    # 时间衰减：越旧的文档得分越低
+    if enable_time_decay:
+        for doc_id, entry in scores.items():
+            retrieved_at = (
+                entry["item"]
+                .get("metadata", {})
+                .get("retrieved_at", "")
+            )
+            decay = _compute_time_decay(retrieved_at)
+            entry["rrf_score"] *= decay
+            entry["time_decay"] = decay
 
     ranked = sorted(
         scores.values(), key=lambda x: x["rrf_score"], reverse=True

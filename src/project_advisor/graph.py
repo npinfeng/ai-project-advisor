@@ -89,14 +89,21 @@ def _evidence_for_project(
 def detect_evidence_gaps(
     candidates: list[str],
     evidences: list[Any],
+    github_url_map: dict[str, str | None] | None = None,
 ) -> list[EvidenceGap]:
-    """Build a deterministic candidate-by-track evidence coverage matrix."""
+    """Build a deterministic candidate-by-track evidence coverage matrix.
+
+    对于没有 GitHub URL 的候选项目，不检查仓库证据缺口——它们完全可以
+    依靠文档搜索和 Web 搜索完成评估。
+    """
     normalized = _normalize_evidences(evidences)
     gaps: list[EvidenceGap] = []
     for candidate in candidates:
         project_evidence = _evidence_for_project(candidate, normalized)
         source_types = {item.source_type for item in project_evidence}
-        if not source_types.intersection(REPOSITORY_SOURCE_TYPES):
+        # 只有明确有 GitHub 的项目才检查仓库证据
+        has_github = github_url_map.get(candidate) if github_url_map else True
+        if has_github and not source_types.intersection(REPOSITORY_SOURCE_TYPES):
             gaps.append(EvidenceGap(
                 project_name=candidate,
                 track="repository",
@@ -196,7 +203,12 @@ async def parallel_research(
 def evidence_coverage(state: AgentState) -> dict[str, Any]:
     """Allow at most one supplemental round for explicit coverage gaps."""
     candidates = state.get("candidates", [])
-    gaps = detect_evidence_gaps(candidates, state.get("evidences", []))
+    github_url_map = {
+        rec.name: rec.github_url
+        for rec in state.get("candidate_recommendations", [])
+        if hasattr(rec, "name")
+    }
+    gaps = detect_evidence_gaps(candidates, state.get("evidences", []), github_url_map)
     if not gaps or state.get("supplemental_round_used", False):
         return {
             "evidence_gaps": gaps,

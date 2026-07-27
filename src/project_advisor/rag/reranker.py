@@ -56,23 +56,35 @@ class Reranker:
     async def _score_single(
         self, query: str, doc: dict, index: int
     ) -> tuple[int, float]:
-        """使用 LLM 对单个文档评分。"""
+        """使用 LLM 对单个文档评分（含新鲜度和权威性）。"""
         text = doc.get("text", "")[:2000]  # 截断以控制成本
         metadata = doc.get("metadata", {})
+        retrieved_at = metadata.get("retrieved_at", "未知")
+        source_type = metadata.get("source_type", "")
+        time_decay = doc.get("time_decay")
+
+        freshness_hint = ""
+        if retrieved_at and retrieved_at != "未知":
+            freshness_hint = f"文档检索时间：{retrieved_at}\n"
+        if time_decay is not None:
+            freshness_hint += f"时间衰减因子：{time_decay:.2f}（1.0=最新，接近0=很旧）\n"
+        if source_type:
+            freshness_hint += f"来源类型：{source_type}（官方文档权威性最高，社区文章较低）\n"
 
         prompt = f"""评估以下文档与查询的相关性（1-10分）。
 
 查询：{query}
 
 文档标题/来源：{metadata.get('source_url', '未知')}
+{freshness_hint}
 文档内容：
 {text}
 
-请给出 1（不相关）到 10（高度相关）的评分。考虑以下因素：
-- 文档是否直接回答了查询问题？
-- 文档是否来自权威来源（官方文档 > 博客）？
-- 文档内容是否新鲜（近 6 个月优先）？
-- 文档是否包含具体的技术细节而非泛泛而谈？"""
+请给出 1（不相关）到 10（高度相关）的评分。考虑以下因素（权重递减）：
+- 文档是否直接回答了查询问题？（最重要）
+- 文档是否来自权威来源（official_documentation > 官方博客 > 社区文章 > 第三方博客）？
+- 文档内容是否新鲜？检索时间距今越近越好，超过 6 个月的应降分。
+- 文档是否包含具体的技术细节（版本号、API 名称、配置示例）而非泛泛而谈？"""
 
         try:
             model = self._get_model()
@@ -80,7 +92,7 @@ class Reranker:
                 return index, 5  # 无模型时默认中等分数
 
             response = await model.ainvoke([
-                SystemMessage(content="你是技术文档相关性评估专家。客观评分，不受文档排序影响。"),
+                SystemMessage(content="你是技术文档相关性评估专家。客观评分，综合考虑相关性、权威性、新鲜度和技术深度。"),
                 HumanMessage(content=prompt),
             ])
             return index, float(response.score)

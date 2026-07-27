@@ -105,35 +105,65 @@ def rag_search(
     pipeline = _get_pipeline()
     rewriter = _get_rewriter()
 
-    # 查询改写
-    rewritten = rewriter.rewrite_sync(query)
-
-    # 混合检索
+    # 生成多角度子查询
     proj = sync_results[0]["project_name"] if project_name else None
-    results = pipeline.search(
-        query=rewritten,
-        project_name=proj,
-        top_k=top_k,
-    )
+    sub_queries = rewriter.multi_query_sync(query)
+    if len(sub_queries) <= 1:
+        sub_queries = [rewriter.rewrite_sync(query)]
 
-    if not results:
+    # 用每个子查询并行搜索，按 chunk_id 去重合并
+    seen_ids: set[str] = set()
+    merged: list[dict] = []
+    for sq in sub_queries:
+        batch = pipeline.search(
+            query=sq,
+            project_name=proj,
+            top_k=max(top_k, 3),
+        )
+        for item in batch:
+            chunk_id = item.get("id", "")
+            if chunk_id and chunk_id not in seen_ids:
+                seen_ids.add(chunk_id)
+                # 出现在更多子查询中的结果得分加权
+                item["multi_query_hits"] = item.get("multi_query_hits", 0) + 1
+                merged.append(item)
+            elif chunk_id in seen_ids:
+                # 已在结果中，增加多查询命中计数
+                for existing in merged:
+                    if existing.get("id") == chunk_id:
+                        existing["multi_query_hits"] = existing.get("multi_query_hits", 1) + 1
+                        existing["score"] = max(existing.get("score", 0), item.get("score", 0))
+                        break
+
+    # 按多查询命中数 + 原始分数排序
+    merged.sort(key=lambda x: (x.get("multi_query_hits", 1), x.get("score", 0)), reverse=True)
+
+    if not merged:
         return f"未在本地知识库中找到与 '{query}' 相关的结果。知识库可能尚未索引相关文档。"
 
-    # 重排序
+    # 重排序（取合并后的 Top 20）
     reranker = _get_reranker()
-    reranked = reranker.rerank_sync(query, results, top_k=min(top_k, len(results)))
+    candidates = merged[:20]
+    reranked = reranker.rerank_sync(query, candidates, top_k=min(top_k, len(candidates)))
 
-    # 格式化输出
+    # 格式化输出（含检索时间，供 Reviewer 评估新鲜度）
     lines = [f"RAG 搜索结果（查询：{query}）：\n"]
     for i, result in enumerate(reranked):
-        source = result.get("metadata", {}).get("source_url", "未知")
-        proj = result.get("project", result.get("metadata", {}).get("project_name", ""))
+        metadata = result.get("metadata", {})
+        source = metadata.get("source_url", "未知")
+        proj = result.get("project", metadata.get("project_name", ""))
         score = result.get("rerank_score", result.get("rrf_score", result.get("score", 0)))
+        retrieved_at = metadata.get("retrieved_at", "未知")
         text = result.get("text", "")[:800]
+        time_decay = result.get("time_decay")
+        freshness_note = ""
+        if time_decay is not None and time_decay < 0.8:
+            freshness_note = f"（新鲜度衰减：{time_decay:.2f}，可能已过时）"
         lines.append(
-            f"## 结果 {i + 1}（相关度：{score:.2f}）\n"
+            f"## 结果 {i + 1}（相关度：{score:.2f}）{freshness_note}\n"
             f"- 项目：{proj}\n"
             f"- 来源：{source}\n"
+            f"- 检索时间：{retrieved_at}\n"
             f"- 内容：{text}\n"
         )
 
@@ -185,13 +215,15 @@ def rag_rebuild(project_name: str = "") -> str:
     return "\n".join(lines)
 
 
-@tool(description="Check the status of the RAG knowledge base — which projects are indexed and how many documents.")
+@tool(description="Check the status of the RAG knowledge base — which projects are indexed, document freshness, and how many documents may be stale.")
 def rag_status() -> str:
-    """查看 RAG 知识库的状态。
+    """查看 RAG 知识库的状态，包含新鲜度信息。
 
     Returns:
         格式化的状态信息
     """
+    from datetime import datetime, timezone
+
     from project_advisor.rag.document_store import DocumentStore
     from project_advisor.rag.bm25_retriever import BM25Retriever
     from project_advisor.rag.vector_store import VectorStore
@@ -201,6 +233,9 @@ def rag_status() -> str:
     bm25 = BM25Retriever()
 
     store_stats = store.get_stats()
+    now = datetime.now(timezone.utc)
+    stale_threshold_days = 180
+
     lines = [
         "RAG 知识库状态：\n",
         f"存储目录：{store_stats['storage_dir']}",
@@ -210,13 +245,52 @@ def rag_status() -> str:
         "\n各项目详情：",
     ]
 
+    total_stale = 0
     for proj, count in store_stats.get("docs_per_project", {}).items():
         vs_count = vs.count(proj)
         bm25_count = bm25.count(proj)
         state = "已建立双路索引" if vs_count and bm25_count else "待同步"
+
+        # 检查该项目下的过期文档
+        try:
+            docs = store.get_by_project(proj, max_results=1000)
+            stale_count = 0
+            newest = "未知"
+            oldest = "未知"
+            for doc in docs:
+                retrieved = getattr(doc, "retrieved_at", "")
+                if retrieved:
+                    try:
+                        dt = datetime.fromisoformat(retrieved)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        age = (now - dt).days
+                        if age > stale_threshold_days:
+                            stale_count += 1
+                        if newest == "未知" or (isinstance(newest, str)):
+                            newest = retrieved[:10]
+                        oldest = retrieved[:10]
+                    except (ValueError, TypeError):
+                        pass
+            total_stale += stale_count
+            freshness = f"最新：{newest}，最旧：{oldest}"
+            if stale_count > 0:
+                freshness += f"，⚠ 过期文档：{stale_count}/{count}"
+            else:
+                freshness += "，✓ 全部新鲜"
+        except Exception:
+            freshness = "无法获取新鲜度"
+
         lines.append(
             f"  - {proj}：{count} 个证据，{vs_count} 个向量，"
-            f"{bm25_count} 个 BM25 分块（{state}）"
+            f"{bm25_count} 个 BM25 分块（{state}）\n"
+            f"    {freshness}"
+        )
+
+    if total_stale > 0:
+        lines.append(
+            f"\n⚠ 共 {total_stale} 条证据超过 {stale_threshold_days} 天，"
+            f"建议对相关项目运行 rag_rebuild 以获取最新数据。"
         )
 
     return "\n".join(lines)

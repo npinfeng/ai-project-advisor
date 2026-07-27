@@ -17,7 +17,7 @@ from project_advisor.configuration import Configuration
 from project_advisor.prompts import reviewer_system_prompt
 from project_advisor.schemas.evidence import Evidence, ProjectScore, ReviewResult
 from project_advisor.state import AgentState
-from project_advisor.tools.citations import detect_conflicts
+from project_advisor.tools.citations import compute_evidence_confidence, detect_conflicts
 from project_advisor.tools.scoring import (
     compare_projects,
     create_criteria_from_config,
@@ -60,7 +60,11 @@ def _bind_scores_to_evidence(
     candidates: list[str],
     evidences: list[Evidence],
 ) -> tuple[list[ProjectScore], list[str]]:
-    """Force one score per confirmed candidate and only attach validated references."""
+    """Force one score per confirmed candidate and attach quality-validated references.
+
+    置信度现在基于证据质量（权威性 × 新鲜度 × 多样性）计算，
+    而非简单的证据数量。3 条低质量社区文章不再被判定为 "high"。
+    """
     score_map = {score.project_name.casefold(): score for score in scores}
     bound_scores: list[ProjectScore] = []
     gaps: list[str] = []
@@ -77,16 +81,23 @@ def _bind_scores_to_evidence(
         matched = _evidence_for_project(candidate, evidences)
         evidence_ids = [evidence.evidence_id for evidence in matched]
         source_urls = list(dict.fromkeys(evidence.source_url for evidence in matched))
-        source_types = {evidence.source_type for evidence in matched}
-        if len(matched) >= 3 and len(source_types) >= 2:
-            confidence = "high"
-        elif len(matched) >= 2:
-            confidence = "medium"
-        elif matched:
-            confidence = "low"
-        else:
-            confidence = "insufficient"
-            gaps.append(f"{candidate} 没有可追溯到该项目的结构化证据。")
+
+        # 使用质量加权置信度计算（替代纯数量逻辑）
+        confidence, confidence_score = compute_evidence_confidence(matched)
+
+        if confidence == "insufficient":
+            gaps.append(
+                f"{candidate} 证据不足"
+                f"（{len(matched)} 条证据，质量分 {confidence_score:.2f}）。"
+            )
+        elif confidence == "low":
+            source_types = {e.source_type for e in matched}
+            gaps.append(
+                f"{candidate} 置信度较低"
+                f"（{len(matched)} 条证据，"
+                f"来源类型：{', '.join(sorted(source_types)) if source_types else '无'}，"
+                f"质量分 {confidence_score:.2f}）。"
+            )
 
         bound_scores.append(
             score.model_copy(
