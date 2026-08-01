@@ -111,13 +111,18 @@ class CandidateProject(BaseModel):
 class CandidateRecommendation(BaseModel):
     """Planner 推荐的候选项目及其入选理由。"""
 
-    name: str = Field(min_length=1, description="Candidate project name.")
+    name: str = Field(
+        min_length=1,
+        max_length=120,
+        description="Candidate project name.",
+    )
     github_url: Optional[str] = Field(
         default=None,
         description="Canonical GitHub repository URL when known.",
     )
     reason: str = Field(
         min_length=1,
+        max_length=2000,
         description="Why this candidate matches the user's requirements.",
     )
 
@@ -146,6 +151,13 @@ class Evidence(BaseModel):
     )
     retrieved_at: str = Field(
         description="ISO datetime when this evidence was collected."
+    )
+    source_date: Optional[str] = Field(
+        default=None,
+        description=(
+            "Publication or last-updated date reported by the source. "
+            "Use this, rather than retrieval time, for freshness decisions."
+        ),
     )
     version_info: Optional[str] = Field(
         default=None, description="Document or software version at time of retrieval."
@@ -198,9 +210,19 @@ class ProjectScore(BaseModel):
     engineering_reliability: float = Field(default=0.0, ge=0.0, le=10.0)
     community_and_maintenance: float = Field(default=0.0, ge=0.0, le=10.0)
     documentation_quality: float = Field(default=0.0, ge=0.0, le=10.0)
-    learning_cost: float = Field(default=0.0, ge=0.0, le=10.0)
+    learning_cost: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=10.0,
+        description="Learning ease: 10 means easiest/lowest learning cost.",
+    )
     extensibility: float = Field(default=0.0, ge=0.0, le=10.0)
-    deployment_cost: float = Field(default=0.0, ge=0.0, le=10.0)
+    deployment_cost: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=10.0,
+        description="Deployment economy: 10 means simplest/lowest operating cost.",
+    )
     weighted_total: float = Field(default=0.0, description="Final weighted total score.")
     justification: str = Field(
         default="", description="Brief justification for the scores."

@@ -63,14 +63,16 @@ def get_evidence_quality_score(
     # 权威性得分
     authority = get_source_authority(evidence.source_type)
 
-    # 新鲜度衰减
-    freshness = 1.0
-    if evidence.retrieved_at:
+    # 新鲜度必须优先使用来源自身的发布日期/更新时间。抓取时间只能说明
+    # "我们何时看过"，不能证明内容是新的。来源日期缺失时采用保守中性值。
+    freshness = 0.7
+    freshness_date = evidence.source_date
+    if freshness_date:
         try:
-            retrieved_dt = datetime.fromisoformat(evidence.retrieved_at)
-            if retrieved_dt.tzinfo is None:
-                retrieved_dt = retrieved_dt.replace(tzinfo=timezone.utc)
-            age_days = (current_date - retrieved_dt).total_seconds() / 86400.0
+            source_dt = datetime.fromisoformat(freshness_date.replace("Z", "+00:00"))
+            if source_dt.tzinfo is None:
+                source_dt = source_dt.replace(tzinfo=timezone.utc)
+            age_days = (current_date - source_dt).total_seconds() / 86400.0
             if age_days > 0:
                 freshness = math.pow(0.5, age_days / FRESHNESS_HALF_LIFE_DAYS)
         except (ValueError, TypeError):
@@ -147,8 +149,17 @@ def check_source_freshness(
         包含新鲜度评估结果的字典
     """
     try:
-        retrieved_date = datetime.fromisoformat(evidence.retrieved_at)
-        age = datetime.now() - retrieved_date
+        if not evidence.source_date:
+            return {
+                "is_fresh": None,
+                "age_days": None,
+                "warning": "来源未提供发布日期或更新时间，不能用抓取时间推断新鲜度。",
+            }
+        source_date = datetime.fromisoformat(
+            evidence.source_date.replace("Z", "+00:00")
+        )
+        now = datetime.now(source_date.tzinfo) if source_date.tzinfo else datetime.now()
+        age = now - source_date
 
         if age > timedelta(days=max_age_days):
             return {

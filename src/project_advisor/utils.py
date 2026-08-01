@@ -4,13 +4,13 @@ import os
 import logging
 import asyncio
 from datetime import datetime
-from typing import Any, List, Literal, Mapping, Optional
+from typing import Any, Literal, Optional
 
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, filter_messages
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import InjectedToolArg, tool
+from langchain_core.tools import tool
 from tavily import AsyncTavilyClient
 
 from project_advisor.configuration import Configuration, SearchAPI
@@ -87,21 +87,9 @@ def create_chat_model(
 
 def get_message_token_usage(message: Any) -> dict[str, int]:
     """Extract provider-neutral token counters from one model response."""
-    usage = getattr(message, "usage_metadata", None)
-    if not isinstance(usage, Mapping):
-        response_metadata = getattr(message, "response_metadata", None)
-        if isinstance(response_metadata, Mapping):
-            usage = response_metadata.get("token_usage") or response_metadata.get("usage")
-    if not isinstance(usage, Mapping):
-        return {"input_tokens": 0, "output_tokens": 0}
-    return {
-        "input_tokens": int(
-            usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
-        ),
-        "output_tokens": int(
-            usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
-        ),
-    }
+    from project_advisor.usage_tracking import message_token_usage
+
+    return message_token_usage(message)
 
 
 def get_tavily_api_key() -> Optional[str]:

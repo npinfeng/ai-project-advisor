@@ -17,6 +17,7 @@ from project_advisor.configuration import Configuration
 from project_advisor.prompts import repo_analyst_system_prompt
 from project_advisor.state import ResearcherState
 from project_advisor.tools.evidence_factory import build_evidences_from_tool_result
+from project_advisor.usage_tracking import add_usage, usage_scope
 from project_advisor.utils import (
     create_chat_model,
     get_message_token_usage,
@@ -61,18 +62,25 @@ async def execute_tool_safely(
 ):
     """安全执行工具，带错误处理和状态码检查。"""
     if tool is None:
-        return "工具执行出错：未找到对应工具。", []
+        return "工具执行出错：未找到对应工具。", [], {
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
     try:
-        result = await tool.ainvoke(args, config)
+        with usage_scope() as nested_usage:
+            result = await tool.ainvoke(args, config)
         return str(result), build_evidences_from_tool_result(
             tool_name=getattr(tool, "name", getattr(tool, "__name__", "unknown")),
             args=args,
             result=result,
             project_name=project_name,
             research_topic=research_topic,
-        )
+        ), dict(nested_usage)
     except Exception as e:
-        return f"工具执行出错：{str(e)}", []
+        return f"工具执行出错：{str(e)}", [], {
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
 
 
 async def analyst_tools(state: ResearcherState, config: RunnableConfig):
@@ -117,7 +125,8 @@ async def analyst_tools(state: ResearcherState, config: RunnableConfig):
         ToolMessage(content=obs[0], name=tc["name"], tool_call_id=tc["id"])
         for obs, tc in zip(observations, executable_calls)
     ]
-    evidences = [evidence for _, batch in observations for evidence in batch]
+    evidences = [evidence for _, batch, _ in observations for evidence in batch]
+    nested_usage = add_usage(*(usage for _, _, usage in observations))
     tool_messages.extend(
         ToolMessage(
             content="研究完成信号已确认。",
@@ -135,12 +144,14 @@ async def analyst_tools(state: ResearcherState, config: RunnableConfig):
         return {
             "researcher_messages": tool_messages,
             "evidences": evidences,
+            "token_usage": nested_usage,
             "next": "compress_research",
         }
 
     return {
         "researcher_messages": tool_messages,
         "evidences": evidences,
+        "token_usage": nested_usage,
         "next": "repository_analyst",
     }
 
@@ -153,6 +164,10 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
             researcher_messages, include_types=["tool"]
         )
     )
+    MAX_RAW_CHARS = 8000
+    was_truncated = len(raw_notes) > MAX_RAW_CHARS
+    truncated_notes = raw_notes[:MAX_RAW_CHARS]
+
     seen: set[str] = set()
     evidence_lines = []
     for evidence in state.get("evidences", []):
@@ -162,9 +177,15 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
         seen.add(evidence_id)
         evidence_lines.append(
             f"- [{evidence_id}] {getattr(evidence, 'source_url', '')} — "
-            f"{str(getattr(evidence, 'content', ''))[:500]}"
+            f"{str(getattr(evidence, 'content', ''))[:800]}"
         )
-    compressed = "\n".join(evidence_lines) or raw_notes[:6000] or "未收集到仓库证据。"
+    compressed = "\n".join(evidence_lines) or truncated_notes or "未收集到仓库证据。"
+    if was_truncated and not evidence_lines:
+        compressed += (
+            f"\n[⚠ 原始工具输出 {len(raw_notes)} 字符，"
+            f"压缩至 {MAX_RAW_CHARS} 字符。"
+            f"部分细节可能丢失，完整证据已持久化至 DocumentStore。]"
+        )
 
     return {
         "compressed_research": compressed,

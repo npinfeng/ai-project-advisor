@@ -40,6 +40,11 @@ from project_advisor.state import (
     ResearcherState,
     ResearchTask,
 )
+from project_advisor.tools.constraint_analyzer import (
+    analyze_feasibility,
+    render_feasibility_report,
+)
+from project_advisor.tools.shared_cache import clear_shared_cache
 
 logger = logging.getLogger(__name__)
 
@@ -185,11 +190,17 @@ async def parallel_research(
     state: AgentState,
     config: RunnableConfig,
 ) -> dict[str, Any]:
-    """Execute one bounded research round and return only new observations."""
+    """Execute one bounded research round and return only new observations.
+
+    首轮研究开始时清空共享缓存，研究员通过缓存共享共性发现。
+    """
     tasks = [
         task if isinstance(task, ResearchTask) else ResearchTask.model_validate(task)
         for task in state.get("research_tasks", [])
     ]
+    # 首轮研究开始时清空缓存，避免跨评估污染
+    if state.get("research_round", 0) == 0:
+        clear_shared_cache()
     evidences, notes, token_usage = await _execute_research_tasks(tasks, config)
     return {
         "evidences": evidences,
@@ -290,6 +301,45 @@ def _route_after_coverage(state: AgentState) -> str:
     return state.get("next", "review_and_score")
 
 
+def feasibility_check(state: AgentState) -> dict[str, Any]:
+    """在研究投入前检测需求物理可行性。
+
+    对 Planner 生成的结构化需求进行分析，识别：
+    - 物理矛盾（离线+大模型API、低内存+大参数）
+    - 约束冲突（候选框架不支持必须功能）
+    - 降级路径（当理想方案不可行时的替代选择）
+
+    预检结果注入 research_brief，供研究阶段和 Reviewer 参考。
+    """
+    requirements = state.get("requirements")
+    candidates = state.get("candidates", [])
+    research_brief = state.get("research_brief", "")
+
+    req_dict = {}
+    if requirements is not None:
+        if hasattr(requirements, "model_dump"):
+            req_dict = requirements.model_dump()
+        elif isinstance(requirements, dict):
+            req_dict = requirements
+
+    report = analyze_feasibility(req_dict, candidates)
+    feasibility_text = render_feasibility_report(report)
+
+    augmented_brief = f"{research_brief}\n\n{feasibility_text}"
+
+    return {
+        "research_brief": augmented_brief,
+        "knowledge_stats": {
+            **state.get("knowledge_stats", {}),
+            "feasibility_check": {
+                "is_feasible": report.is_feasible,
+                "violation_count": len(report.violations),
+                "degradation_path_count": len(report.degradation_paths),
+            },
+        },
+    }
+
+
 repo_builder = StateGraph(
     ResearcherState,
     output_schema=ResearcherOutputState,
@@ -348,6 +398,7 @@ deep_researcher_builder = StateGraph(
 )
 deep_researcher_builder.add_node("clarify_requirements", clarify_requirements)
 deep_researcher_builder.add_node("plan_evaluation", plan_evaluation)
+deep_researcher_builder.add_node("feasibility_check", feasibility_check)
 deep_researcher_builder.add_node("parallel_research", parallel_research)
 deep_researcher_builder.add_node("evidence_coverage", evidence_coverage)
 deep_researcher_builder.add_node("supplemental_research", parallel_research)
@@ -360,11 +411,8 @@ deep_researcher_builder.add_conditional_edges(
     _route_after_clarify,
     {"plan_evaluation": "plan_evaluation", END: END},
 )
-deep_researcher_builder.add_conditional_edges(
-    "plan_evaluation",
-    _route_after_plan,
-    {"parallel_research": "parallel_research"},
-)
+deep_researcher_builder.add_edge("plan_evaluation", "feasibility_check")
+deep_researcher_builder.add_edge("feasibility_check", "parallel_research")
 deep_researcher_builder.add_edge("parallel_research", "evidence_coverage")
 deep_researcher_builder.add_conditional_edges(
     "evidence_coverage",

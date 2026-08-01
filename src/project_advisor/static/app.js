@@ -1,6 +1,7 @@
 const form = document.querySelector("#advisorForm");
 const questionInput = document.querySelector("#question");
 const candidatesInput = document.querySelector("#candidates");
+const apiKeyInput = document.querySelector("#apiKey");
 const submitButton = document.querySelector("#submitButton");
 const submitButtonLabel = document.querySelector("#submitButtonLabel");
 const cancelButton = document.querySelector("#cancelButton");
@@ -37,12 +38,20 @@ const evaluationMeta = document.querySelector("#evaluationMeta");
 const stageOrder = [
   "clarify_requirements",
   "plan_evaluation",
+  "feasibility_check",
   "parallel_research",
   "evidence_coverage",
   "supplemental_research",
   "review_and_score",
   "generate_report",
 ];
+
+function apiHeaders() {
+  const headers = { "Content-Type": "application/json" };
+  const apiKey = apiKeyInput?.value.trim();
+  if (apiKey) headers["X-API-Key"] = apiKey;
+  return headers;
+}
 
 const examples = {
   agent: {
@@ -198,6 +207,7 @@ function activateStage(nodeName, durationMs, routedNext) {
 
 function renderDiagnostics(diagnostics) {
   const tokenUsage = diagnostics.token_usage || {};
+  const budget = diagnostics.budget || {};
   const mcp = diagnostics.mcp || {};
   const mcpLabels = {
     connected: "已连接",
@@ -213,10 +223,10 @@ function renderDiagnostics(diagnostics) {
   runtimeCitations.textContent = String(diagnostics.citation_url_count ?? 0);
   runtimeMcp.textContent = `${mcpLabels[mcp.status] || mcp.status || "未知"} / ${mcp.tool_count ?? 0}`;
   runtimeTokens.textContent = tokenUsage.collected
-    ? Number(tokenUsage.total_tokens || 0).toLocaleString("zh-CN")
+    ? `${Number(tokenUsage.total_tokens || 0).toLocaleString("zh-CN")}${budget.token_limit_enabled ? ` / ${Number(budget.max_run_tokens).toLocaleString("zh-CN")}` : ""}`
     : "未采集";
   runtimeCost.textContent = diagnostics.cost_configured && tokenUsage.collected
-    ? `$${Number(diagnostics.estimated_cost_usd || 0).toFixed(6)}`
+    ? `$${Number(diagnostics.estimated_cost_usd || 0).toFixed(6)}${budget.cost_limit_enabled ? ` / $${Number(budget.max_run_cost_usd).toFixed(4)}` : ""}`
     : "未配置单价";
   diagnosticsCollectionState.textContent = tokenUsage.collected
     ? "模型 usage 已采集"
@@ -432,7 +442,7 @@ form.addEventListener("submit", async (event) => {
     try {
       const response = await fetch("/api/candidates/suggest", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(),
         body: JSON.stringify({ question: questionInput.value }),
         signal: controller.signal,
       });
@@ -482,7 +492,7 @@ form.addEventListener("submit", async (event) => {
   try {
     const response = await fetch("/api/advice/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(),
       body: JSON.stringify({
         question: questionInput.value,
         candidates: uniqueCandidates,

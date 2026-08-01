@@ -54,6 +54,13 @@
           <span id="charCount">0 / 5000</span>
         </div>
 
+        <details class="api-access">
+          <summary>API 访问设置（可选）</summary>
+          <label for="apiKey">访问密钥</label>
+          <input id="apiKey" name="apiKey" type="password" autocomplete="off"
+                 placeholder="仅当服务端配置 ADVISOR_API_KEY 时填写">
+        </details>
+
         <fieldset class="candidate-mode" aria-labelledby="candidateModeLabel">
           <legend id="candidateModeLabel">候选项目来源</legend>
           <label class="mode-option">
@@ -125,28 +132,33 @@
             <div><strong>生成评估计划</strong><small>确定候选项与研究维度</small></div>
             <span class="timeline-state">等待</span>
           </li>
-          <li data-node="parallel_research">
+          <li data-node="feasibility_check">
             <span class="timeline-icon">03</span>
+            <div><strong>约束可行性预检</strong><small>识别硬约束冲突和降级路径</small></div>
+            <span class="timeline-state">等待</span>
+          </li>
+          <li data-node="parallel_research">
+            <span class="timeline-icon">04</span>
             <div><strong>专业化并行研究</strong><small>隔离的仓库与文档工具集</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="evidence_coverage">
-            <span class="timeline-icon">04</span>
+            <span class="timeline-icon">05</span>
             <div><strong>确定性证据检查</strong><small>按候选项目和来源轨道检查缺口</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="supplemental_research">
-            <span class="timeline-icon">05</span>
+            <span class="timeline-icon">06</span>
             <div><strong>受限补充研究</strong><small>仅缺口存在时执行一次</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="review_and_score">
-            <span class="timeline-icon">06</span>
+            <span class="timeline-icon">07</span>
             <div><strong>证据审查与评分</strong><small>七维加权评分与冲突检查</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="generate_report">
-            <span class="timeline-icon">07</span>
+            <span class="timeline-icon">08</span>
             <div><strong>确定性报告生成</strong><small>模板渲染结论、风险与引用</small></div>
             <span class="timeline-state">等待</span>
           </li>

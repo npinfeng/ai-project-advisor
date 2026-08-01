@@ -13,6 +13,8 @@ from typing import Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from project_advisor.usage_tracking import record_message_usage
+
 
 class RelevanceScore(BaseModel):
     """文档相关性评分。"""
@@ -48,7 +50,11 @@ class Reranker:
             from project_advisor.utils import create_chat_model
             self._model = (
                 create_chat_model(self.model_name)
-                .with_structured_output(RelevanceScore, method="function_calling")
+                .with_structured_output(
+                    RelevanceScore,
+                    method="function_calling",
+                    include_raw=True,
+                )
                 .with_retry(stop_after_attempt=2)
             )
         return self._model
@@ -91,11 +97,16 @@ class Reranker:
             if model is None:
                 return index, 5  # 无模型时默认中等分数
 
-            response = await model.ainvoke([
-                SystemMessage(content="你是技术文档相关性评估专家。客观评分，综合考虑相关性、权威性、新鲜度和技术深度。"),
-                HumanMessage(content=prompt),
-            ])
-            return index, float(response.score)
+            for _ in range(2):
+                envelope = await model.ainvoke([
+                    SystemMessage(content="你是技术文档相关性评估专家。客观评分，综合考虑相关性、权威性、新鲜度和技术深度。"),
+                    HumanMessage(content=prompt),
+                ])
+                record_message_usage(envelope.get("raw"))
+                response = envelope.get("parsed")
+                if response is not None:
+                    return index, float(response.score)
+            return index, 5
         except Exception:
             return index, 5  # 出错时保持原分数
 

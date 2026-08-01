@@ -104,6 +104,7 @@ def test_citation_tools():
         content="Detailed documentation content.",
         relevance="documentation",
         retrieved_at="2026-07-20T10:00:00",
+        source_date="2026-07-20T10:00:00",
     )
 
     freshness = check_source_freshness(ev)
@@ -142,13 +143,26 @@ def test_document_collector():
     """验证文档采集工具的 URL 解析和内容检测。"""
     from project_advisor.tools.document_collector import (
         detect_document_type,
+        extract_source_date,
         extract_domain,
         truncate_content,
         create_content_hash,
+        validate_public_web_url,
     )
+    from bs4 import BeautifulSoup
+    import asyncio
 
     # URL 域名提取
     assert extract_domain("https://docs.langchain.com/oss/python/langgraph") == "docs.langchain.com"
+
+    dated = BeautifulSoup(
+        '<html><meta property="article:published_time" content="2026-07-01T08:00:00Z"></html>',
+        "html.parser",
+    )
+    assert extract_source_date(dated) == "2026-07-01T08:00:00Z"
+    with pytest.raises(ValueError, match="禁止访问"):
+        asyncio.run(validate_public_web_url("http://127.0.0.1/internal"))
+    assert asyncio.run(validate_public_web_url("https://8.8.8.8/docs"))
     assert extract_domain("https://github.com/langchain-ai/langgraph") == "github.com"
 
     # 文档类型检测

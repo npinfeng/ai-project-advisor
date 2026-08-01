@@ -9,6 +9,8 @@
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from project_advisor.usage_tracking import record_message_usage
+
 
 class RewrittenQuery(BaseModel):
     """改写后的查询。"""
@@ -29,7 +31,7 @@ class QueryRewriter:
     支持生成多角度子查询以覆盖不同评估维度。
     """
 
-    def __init__(self, model_name: str = "deepseek:deepseek-v4-flash"):
+    def __init__(self, model_name: str = "deepseek:deepseek-chat"):
         """初始化查询改写器。
 
         Args:
@@ -44,7 +46,11 @@ class QueryRewriter:
             from project_advisor.utils import create_chat_model
             self._rewrite_model = (
                 create_chat_model(self.model_name)
-                .with_structured_output(RewrittenQuery, method="function_calling")
+                .with_structured_output(
+                    RewrittenQuery,
+                    method="function_calling",
+                    include_raw=True,
+                )
                 .with_retry(stop_after_attempt=2)
             )
         return self._rewrite_model
@@ -54,7 +60,11 @@ class QueryRewriter:
             from project_advisor.utils import create_chat_model
             self._multi_query_model = (
                 create_chat_model(self.model_name)
-                .with_structured_output(MultiQueries, method="function_calling")
+                .with_structured_output(
+                    MultiQueries,
+                    method="function_calling",
+                    include_raw=True,
+                )
                 .with_retry(stop_after_attempt=2)
             )
         return self._multi_query_model
@@ -87,11 +97,16 @@ class QueryRewriter:
 只返回改写后的查询，不要解释。"""
 
         try:
-            response = await model.ainvoke([
-                SystemMessage(content="你是信息检索专家。将用户问题改写为高效的搜索查询。"),
-                HumanMessage(content=prompt),
-            ])
-            return response.rewritten
+            for _ in range(2):
+                envelope = await model.ainvoke([
+                    SystemMessage(content="你是信息检索专家。将用户问题改写为高效的搜索查询。"),
+                    HumanMessage(content=prompt),
+                ])
+                record_message_usage(envelope.get("raw"))
+                response = envelope.get("parsed")
+                if response is not None:
+                    return response.rewritten
+            return query
         except Exception:
             return query
 
@@ -130,10 +145,18 @@ class QueryRewriter:
 只返回查询列表。"""
 
         try:
-            response = await model.ainvoke([
-                SystemMessage(content="你是技术搜索专家。从多角度生成精确的搜索查询以覆盖技术选型的所有维度。"),
-                HumanMessage(content=prompt),
-            ])
+            response = None
+            for _ in range(2):
+                envelope = await model.ainvoke([
+                    SystemMessage(content="你是技术搜索专家。从多角度生成精确的搜索查询以覆盖技术选型的所有维度。"),
+                    HumanMessage(content=prompt),
+                ])
+                record_message_usage(envelope.get("raw"))
+                response = envelope.get("parsed")
+                if response is not None:
+                    break
+            if response is None:
+                return [query]
             # 原始查询也保留
             all_queries = [query] + response.queries
             return all_queries[:6]  # 最多 6 个查询

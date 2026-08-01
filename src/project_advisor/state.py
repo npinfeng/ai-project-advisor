@@ -25,6 +25,7 @@ class ResearchPlan(BaseModel):
     """Planner 生成的研究计划。"""
 
     research_brief: str = Field(
+        max_length=10000,
         description="Detailed research brief describing what needs to be investigated.",
     )
     requirements: Requirements = Field(
@@ -36,6 +37,7 @@ class ResearchPlan(BaseModel):
         description="Candidate projects with repository URLs and recommendation reasons.",
     )
     evaluation_focus: list[str] = Field(
+        max_length=20,
         description="Key evaluation dimensions to focus on during research.",
     )
 

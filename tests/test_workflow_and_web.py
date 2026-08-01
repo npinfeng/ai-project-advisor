@@ -5,7 +5,7 @@ import importlib
 import json
 
 from fastapi.testclient import TestClient
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from project_advisor.graph import (
     detect_evidence_gaps,
@@ -177,10 +177,74 @@ def test_tool_output_is_normalized_and_score_is_bound_to_evidence():
     assert gaps
 
 
+def test_failed_tool_output_is_not_evidence_and_source_metadata_is_precise():
+    failed = build_evidences_from_tool_result(
+        tool_name="github_get_repo",
+        args={"github_url": "https://github.com/example/missing"},
+        result="仓库不存在：example/missing",
+        project_name="Missing",
+        research_topic="维护状态",
+    )
+    assert failed == []
+
+    fetched = build_evidences_from_tool_result(
+        tool_name="web_fetch_tool",
+        args={"url": "https://blog.example.com/post"},
+        result=(
+            "URL：https://blog.example.com/post\n文档类型：blog\n"
+            "内容日期：2026-06-10T00:00:00Z\n正文：真实内容"
+        ),
+        project_name="Example",
+        research_topic="文档质量",
+    )
+    assert len(fetched) == 1
+    assert fetched[0].source_type == "blog"
+    assert fetched[0].source_date == "2026-06-10T00:00:00Z"
+
+
+def test_reviewer_score_rubric_and_token_usage(monkeypatch):
+    reviewer_module = importlib.import_module("project_advisor.agents.reviewer")
+    captured = {}
+
+    class FakeStructuredModel:
+        def with_structured_output(self, *args, **kwargs):
+            assert kwargs["include_raw"] is True
+            return self
+
+        def with_retry(self, *args, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            captured["prompt"] = messages[-1].content
+            return {
+                "parsed": ReviewResult(
+                    analysis="证据有限。",
+                    scores=[ProjectScore(project_name="LangGraph", learning_cost=8, deployment_cost=7)],
+                    evidence_gaps=[],
+                ),
+                "raw": AIMessage(
+                    content="",
+                    usage_metadata={"input_tokens": 120, "output_tokens": 30, "total_tokens": 150},
+                ),
+                "parsing_error": None,
+            }
+
+    monkeypatch.setattr(reviewer_module, "create_chat_model", lambda *a, **k: FakeStructuredModel())
+    result, usage = asyncio.run(reviewer_module._review_single_candidate(
+        "LangGraph", [], "评估易用性", reviewer_module.Configuration()
+    ))
+
+    assert result.scores[0].learning_cost == 8
+    assert "10 分=最容易上手" in captured["prompt"]
+    assert "10 分=部署运维最简单" in captured["prompt"]
+    assert usage == {"input_tokens": 120, "output_tokens": 30}
+
+
 class FakeGraph:
     async def astream(self, *args, **kwargs):
         yield {"clarify_requirements": {"next": "plan_evaluation"}}
         yield {"plan_evaluation": {"candidates": ["LangGraph"]}}
+        yield {"feasibility_check": {"knowledge_stats": {"feasibility_check": {"is_feasible": True}}}}
         yield {
             "parallel_research": {
                 "notes": ["Evidence"],
@@ -199,6 +263,7 @@ class FakeGraph:
         }
         yield {
             "review_and_score": {
+                "token_usage": {"input_tokens": 100, "output_tokens": 25},
                 "scores": [
                     ProjectScore(
                         project_name="LangGraph",
@@ -232,6 +297,7 @@ def test_web_app_and_sse_stream(monkeypatch):
     assert "开始深度评估" in page_response.text
     assert "系统评测看板" in page_response.text
     assert "本次运行诊断" in page_response.text
+    assert "约束可行性预检" in page_response.text
 
     evaluation_response = client.get("/api/evaluation")
     assert evaluation_response.status_code == 200
@@ -262,6 +328,7 @@ def test_web_app_and_sse_stream(monkeypatch):
     assert '"stage_duration_ms"' in body
     assert '"stage_durations_ms"' in body
     assert '"token_usage"' in body
+    assert '"total_tokens": 125' in body
     assert '"retrieved_evidences"' in body
     assert '"evidence_id"' in body
 
@@ -342,3 +409,52 @@ def test_candidate_suggestion_preview(monkeypatch):
     assert payload["requirements"]["language"] == "Python"
     assert len(payload["candidates"]) == 2
     assert payload["candidates"][0]["reason"]
+    assert "planning_diagnostics" in payload
+
+
+def test_api_key_rate_limit_and_capacity_protection(monkeypatch):
+    app_module = importlib.import_module("project_advisor.app")
+    app_module._rate_windows.clear()
+    app_module._active_expensive_requests = 0
+    monkeypatch.setenv("ADVISOR_API_KEY", "test-secret")
+    monkeypatch.setenv("API_RATE_LIMIT_PER_MINUTE", "1")
+
+    plan = ResearchPlan(
+        research_brief="测试计划",
+        requirements=Requirements(language="Python"),
+        candidates=[CandidateRecommendation(name="LangGraph", reason="测试")],
+        evaluation_focus=["feature_match"],
+    )
+
+    async def fake_plan(question):
+        return plan
+
+    monkeypatch.setattr(app_module, "_generate_candidate_plan", fake_plan)
+    client = TestClient(app_module.app)
+    payload = {"question": "请推荐一个适合 Python 的 Agent 框架。"}
+
+    assert client.post("/api/candidates/suggest", json=payload).status_code == 401
+    headers = {"X-API-Key": "test-secret"}
+    assert client.post("/api/candidates/suggest", json=payload, headers=headers).status_code == 200
+    assert client.post("/api/candidates/suggest", json=payload, headers=headers).status_code == 429
+
+    app_module._rate_windows.clear()
+    app_module._active_expensive_requests = 1
+    monkeypatch.setenv("MAX_CONCURRENT_EVALUATIONS", "1")
+    assert client.post("/api/candidates/suggest", json=payload, headers=headers).status_code == 429
+    app_module._active_expensive_requests = 0
+
+
+def test_observed_token_and_cost_budgets():
+    app_module = importlib.import_module("project_advisor.app")
+    config = app_module.Configuration(
+        max_run_tokens=100,
+        max_run_cost_usd=0.001,
+        input_price_per_million=10,
+        output_price_per_million=20,
+    )
+
+    assert "Token 上限" in app_module._budget_violation(config, 90, 20)
+    cost_only = config.model_copy(update={"max_run_tokens": 0})
+    assert "成本上限" in app_module._budget_violation(cost_only, 100, 10)
+    assert app_module._budget_violation(cost_only, 10, 5) is None

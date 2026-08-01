@@ -75,6 +75,12 @@ C:\miniconda\envs\agent\python.exe -m uvicorn project_advisor.app:app --host 127
 | `POST` | `/api/advice/stream` | SSE 技术评估流 |
 | `GET` | `/api/evaluation` | 最新离线评测基线 |
 
+默认服务只绑定 `127.0.0.1`。如果暴露到局域网或公网，必须配置
+`ADVISOR_API_KEY`，并在反向代理层继续启用 TLS 和访问控制。高成本接口还受
+单客户端速率限制、单进程全局并发上限、Token 上限和成本上限保护；成本上限
+只有在配置输入/输出 Token 单价后才能生效。网页抓取会拒绝私网、回环、保留
+地址以及跳转到这些地址的请求，可通过 `WEB_FETCH_DOMAIN_ALLOWLIST` 进一步收窄域名。
+
 ## MCP 配置
 
 内置 MCP Server 默认启用，提供两个确定性工具：

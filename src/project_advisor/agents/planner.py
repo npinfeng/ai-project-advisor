@@ -18,7 +18,12 @@ from project_advisor.state import (
     ResearchPlan,
     ResearchTask,
 )
-from project_advisor.utils import create_chat_model, get_today_str
+from project_advisor.utils import (
+    create_chat_model,
+    get_message_token_usage,
+    get_today_str,
+)
+from project_advisor.usage_tracking import add_usage
 
 
 def _count_clarification_rounds(messages: list) -> int:
@@ -98,6 +103,7 @@ async def clarify_requirements(state: AgentState, config: RunnableConfig):
     )
 
     response = await clarify_model.ainvoke([HumanMessage(content=prompt)])
+    token_usage = get_message_token_usage(response)
 
     # 尝试以 JSON 解析回复
     import json
@@ -126,6 +132,7 @@ async def clarify_requirements(state: AgentState, config: RunnableConfig):
         return {
             "messages": [AIMessage(content=question)],
             "clarification_round": clarification_round + 1,
+            "token_usage": token_usage,
             "next": "__end__",
         }
 
@@ -134,6 +141,7 @@ async def clarify_requirements(state: AgentState, config: RunnableConfig):
     return {
         "messages": [AIMessage(content=confirm_msg)],
         "clarification_round": clarification_round + 1,
+        "token_usage": token_usage,
         "next": "plan_evaluation",
     }
 
@@ -143,13 +151,26 @@ async def generate_research_plan(
     config: RunnableConfig,
 ) -> ResearchPlan:
     """Generate the reusable structured plan used by preview and execution."""
+    plan, _ = await generate_research_plan_with_usage(messages, config)
+    return plan
+
+
+async def generate_research_plan_with_usage(
+    messages: list,
+    config: RunnableConfig,
+) -> tuple[ResearchPlan, dict[str, int]]:
+    """Generate a structured plan while preserving provider usage metadata."""
     configurable = Configuration.from_runnable_config(config)
     research_model = (
         create_chat_model(
             configurable.research_model,
             max_tokens=configurable.research_model_max_tokens,
         )
-        .with_structured_output(ResearchPlan, method="function_calling")
+        .with_structured_output(
+            ResearchPlan,
+            method="function_calling",
+            include_raw=True,
+        )
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
     )
 
@@ -157,7 +178,14 @@ async def generate_research_plan(
         messages=get_buffer_string(messages),
         date=get_today_str(),
     )
-    return await research_model.ainvoke([HumanMessage(content=prompt)])
+    usage_values = []
+    for _ in range(configurable.max_structured_output_retries):
+        envelope = await research_model.ainvoke([HumanMessage(content=prompt)])
+        usage_values.append(get_message_token_usage(envelope.get("raw")))
+        plan = envelope.get("parsed")
+        if plan is not None:
+            return plan, add_usage(*usage_values)
+    raise ValueError("Planner 未返回有效的结构化研究计划。")
 
 
 def _apply_confirmed_candidates(

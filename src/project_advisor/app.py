@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_EVALUATION_FILE = PROJECT_ROOT / "evals" / "real_results.json"
 URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]{}]+")
 graph: Any | None = None
+_rate_windows: dict[str, list[float]] = {}
+_rate_lock = asyncio.Lock()
+_capacity_lock = asyncio.Lock()
+_active_expensive_requests = 0
 
 app = FastAPI(
     title="AI Project Advisor",
@@ -57,9 +62,18 @@ class AdviceRequest(BaseModel):
         normalized = []
         for candidate in value:
             candidate_name = candidate.strip()
+            if len(candidate_name) > 120:
+                raise ValueError("单个候选项目名称不能超过 120 个字符。")
             if candidate_name and candidate_name not in normalized:
                 normalized.append(candidate_name)
         return normalized
+
+    @field_validator("confirmed_plan")
+    @classmethod
+    def limit_confirmed_plan(cls, value: dict[str, Any] | None):
+        if value is not None and len(json.dumps(value, ensure_ascii=False)) > 100_000:
+            raise ValueError("确认计划不能超过 100000 个字符。")
+        return value
 
 
 class CandidateSuggestionRequest(BaseModel):
@@ -76,12 +90,85 @@ class CandidateSuggestionRequest(BaseModel):
 NODE_LABELS = {
     "clarify_requirements": "需求解析",
     "plan_evaluation": "生成评估计划",
+    "feasibility_check": "约束可行性预检",
     "parallel_research": "专业化并行研究",
     "evidence_coverage": "确定性证据检查",
     "supplemental_research": "受限补充研究",
     "review_and_score": "证据审查与评分",
     "generate_report": "确定性报告生成",
 }
+
+
+def _presented_api_key(request: Request) -> str:
+    direct = request.headers.get("x-api-key", "").strip()
+    if direct:
+        return direct
+    authorization = request.headers.get("authorization", "").strip()
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+async def _protect_expensive_endpoint(request: Request) -> Configuration:
+    """Apply optional authentication and per-client in-memory rate limiting."""
+    config = Configuration.from_runnable_config()
+    if config.advisor_api_key:
+        presented = _presented_api_key(request)
+        if not presented or not secrets.compare_digest(
+            presented, config.advisor_api_key
+        ):
+            raise HTTPException(status_code=401, detail="API 访问密钥无效。")
+
+    client_host = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - 60.0
+    async with _rate_lock:
+        recent = [stamp for stamp in _rate_windows.get(client_host, []) if stamp > cutoff]
+        if len(recent) >= config.api_rate_limit_per_minute:
+            raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试。")
+        recent.append(now)
+        _rate_windows[client_host] = recent
+    return config
+
+
+async def _try_acquire_capacity(limit: int) -> bool:
+    global _active_expensive_requests
+    async with _capacity_lock:
+        if _active_expensive_requests >= limit:
+            return False
+        _active_expensive_requests += 1
+        return True
+
+
+async def _release_capacity() -> None:
+    global _active_expensive_requests
+    async with _capacity_lock:
+        _active_expensive_requests = max(0, _active_expensive_requests - 1)
+
+
+async def _with_capacity_release(stream: AsyncIterator[str]) -> AsyncIterator[str]:
+    try:
+        async for item in stream:
+            yield item
+    finally:
+        await _release_capacity()
+
+
+def _budget_violation(
+    config: Configuration,
+    input_tokens: int,
+    output_tokens: int,
+) -> str | None:
+    total_tokens = input_tokens + output_tokens
+    if config.max_run_tokens and total_tokens > config.max_run_tokens:
+        return f"任务已达到 Token 上限（{config.max_run_tokens}）。"
+    observed_cost = (
+        input_tokens * config.input_price_per_million
+        + output_tokens * config.output_price_per_million
+    ) / 1_000_000
+    if config.max_run_cost_usd and observed_cost > config.max_run_cost_usd:
+        return f"任务已达到成本上限（${config.max_run_cost_usd:.4f}）。"
+    return None
 
 
 def _sse_event(event: str, data: dict[str, Any]) -> str:
@@ -132,9 +219,9 @@ async def _generate_candidate_plan(question: str) -> Any:
     """Generate the same structured plan later consumed by the workflow."""
     from langchain_core.messages import HumanMessage
 
-    from project_advisor.agents.planner import generate_research_plan
+    from project_advisor.agents.planner import generate_research_plan_with_usage
 
-    return await generate_research_plan(
+    return await generate_research_plan_with_usage(
         [HumanMessage(content=question)],
         {"configurable": {"allow_clarification": False}},
     )
@@ -238,6 +325,19 @@ def _build_runtime_diagnostics(
         "cost_configured": (
             config.input_price_per_million > 0 or config.output_price_per_million > 0
         ),
+        "budget": {
+            "max_run_tokens": config.max_run_tokens,
+            "max_run_cost_usd": config.max_run_cost_usd,
+            "token_limit_enabled": config.max_run_tokens > 0,
+            "cost_limit_enabled": config.max_run_cost_usd > 0,
+            "cost_limit_enforceable": (
+                config.max_run_cost_usd > 0
+                and (
+                    config.input_price_per_million > 0
+                    or config.output_price_per_million > 0
+                )
+            ),
+        },
     }
 
 
@@ -260,8 +360,13 @@ async def _stream_graph(
     started_at = time.perf_counter()
     stage_started_at = started_at
     stage_durations_ms: dict[str, int] = {}
-    input_tokens = 0
-    output_tokens = 0
+    planning_diagnostics = (
+        payload.confirmed_plan.get("planning_diagnostics", {})
+        if payload.confirmed_plan
+        else {}
+    )
+    planning_usage = planning_diagnostics.get("token_usage", {})
+    input_tokens, output_tokens = _usage_values(planning_usage)
 
     yield _sse_event(
         "started",
@@ -299,6 +404,12 @@ async def _stream_graph(
                 update_input, update_output = _collect_token_usage(output)
                 input_tokens += update_input
                 output_tokens += update_output
+                budget_error = _budget_violation(
+                    runtime_config, input_tokens, output_tokens
+                )
+                if budget_error:
+                    yield _sse_event("error", {"message": budget_error})
+                    return
                 if node_name == "review_and_score":
                     scores = _serialize_scores(output.get("scores", []))
                 if output.get("evidences"):
@@ -404,17 +515,40 @@ async def evaluation_dashboard() -> dict[str, Any]:
 
 
 @app.post("/api/candidates/suggest")
-async def suggest_candidates(payload: CandidateSuggestionRequest) -> dict[str, Any]:
+async def suggest_candidates(
+    payload: CandidateSuggestionRequest,
+    request: Request,
+) -> dict[str, Any]:
     """Preview structured requirements and AI-recommended candidates."""
+    config = await _protect_expensive_endpoint(request)
+    if not await _try_acquire_capacity(config.max_concurrent_evaluations):
+        raise HTTPException(status_code=429, detail="服务繁忙，请稍后重试。")
     try:
-        plan = await _generate_candidate_plan(payload.question)
-        return plan.model_dump() if hasattr(plan, "model_dump") else dict(plan)
+        generated = await _generate_candidate_plan(payload.question)
+        if isinstance(generated, tuple):
+            plan, token_usage = generated
+        else:
+            plan, token_usage = generated, {"input_tokens": 0, "output_tokens": 0}
+        result = plan.model_dump() if hasattr(plan, "model_dump") else dict(plan)
+        result["planning_diagnostics"] = {
+            "token_usage": token_usage,
+            "estimated_cost_usd": round(
+                (
+                    token_usage.get("input_tokens", 0) * config.input_price_per_million
+                    + token_usage.get("output_tokens", 0) * config.output_price_per_million
+                ) / 1_000_000,
+                6,
+            ),
+        }
+        return result
     except Exception as error:
         logger.exception("Candidate suggestion failed")
         raise HTTPException(
             status_code=503,
             detail="候选项目生成失败，请检查模型配置后重试。",
         ) from error
+    finally:
+        await _release_capacity()
 
 
 @app.post("/api/advice/stream")
@@ -422,8 +556,11 @@ async def stream_advice(
     payload: AdviceRequest,
     request: Request,
 ) -> StreamingResponse:
+    config = await _protect_expensive_endpoint(request)
+    if not await _try_acquire_capacity(config.max_concurrent_evaluations):
+        raise HTTPException(status_code=429, detail="深度评估并发已满，请稍后重试。")
     return StreamingResponse(
-        _stream_graph(payload, request),
+        _with_capacity_release(_stream_graph(payload, request)),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -8,8 +8,11 @@
 
 from typing import Optional
 
+from langchain_core.runnables import RunnableConfig
+
 from langchain_core.tools import tool
 
+from project_advisor.configuration import Configuration
 from project_advisor.rag.ingestion import IngestionPipeline
 from project_advisor.rag.query_rewriter import QueryRewriter
 from project_advisor.rag.reranker import Reranker
@@ -27,17 +30,17 @@ def _get_pipeline() -> IngestionPipeline:
     return _pipeline
 
 
-def _get_rewriter() -> QueryRewriter:
+def _get_rewriter(model_name: str) -> QueryRewriter:
     global _rewriter
-    if _rewriter is None:
-        _rewriter = QueryRewriter()
+    if _rewriter is None or _rewriter.model_name != model_name:
+        _rewriter = QueryRewriter(model_name=model_name)
     return _rewriter
 
 
-def _get_reranker() -> Reranker:
+def _get_reranker(model_name: str) -> Reranker:
     global _reranker
-    if _reranker is None:
-        _reranker = Reranker()
+    if _reranker is None or _reranker.model_name != model_name:
+        _reranker = Reranker(model_name=model_name)
     return _reranker
 
 
@@ -80,6 +83,7 @@ def rag_search(
     query: str,
     project_name: str = "",
     top_k: int = 5,
+    config: RunnableConfig = None,
 ) -> str:
     """搜索本地 RAG 知识库。
 
@@ -103,7 +107,8 @@ def rag_search(
         return f"本地知识库中还没有 {scope} 的持久化证据。"
 
     pipeline = _get_pipeline()
-    rewriter = _get_rewriter()
+    configurable = Configuration.from_runnable_config(config)
+    rewriter = _get_rewriter(configurable.research_model)
 
     # 生成多角度子查询
     proj = sync_results[0]["project_name"] if project_name else None
@@ -142,7 +147,7 @@ def rag_search(
         return f"未在本地知识库中找到与 '{query}' 相关的结果。知识库可能尚未索引相关文档。"
 
     # 重排序（取合并后的 Top 20）
-    reranker = _get_reranker()
+    reranker = _get_reranker(configurable.research_model)
     candidates = merged[:20]
     reranked = reranker.rerank_sync(query, candidates, top_k=min(top_k, len(candidates)))
 

@@ -106,6 +106,32 @@ class Configuration(BaseModel):
         description="诊断面板使用的输出 Token 单价（USD / 1M Token）",
     )
 
+    # ===== Web 安全与资源保护 =====
+    advisor_api_key: Optional[str] = Field(
+        default=None,
+        description="可选的 Web API 访问密钥；为空时仅建议绑定回环地址使用",
+    )
+    api_rate_limit_per_minute: int = Field(
+        default=20,
+        ge=1,
+        description="单个客户端每分钟最多发起的高成本 API 请求数",
+    )
+    max_concurrent_evaluations: int = Field(
+        default=2,
+        ge=1,
+        description="单进程允许同时执行的深度评估任务数",
+    )
+    max_run_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="单次评估 Token 硬上限；0 表示不启用",
+    )
+    max_run_cost_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="单次评估已观测成本硬上限；0 表示不启用",
+    )
+
     # ===== 评分权重配置 =====
     weight_feature_match: float = Field(default=0.30, ge=0.0, le=1.0)
     weight_engineering_reliability: float = Field(default=0.20, ge=0.0, le=1.0)
