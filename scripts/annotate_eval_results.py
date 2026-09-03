@@ -21,6 +21,24 @@ def finalize_annotations(
         raise ValueError("输入文件不是 pending 状态。")
     if not annotator.strip():
         raise ValueError("annotator 不能为空。")
+    if ground_truth_confirmed:
+        required_provenance = (
+            "golden_suite_name",
+            "golden_suite_version",
+            "golden_suite_sha256",
+            "ground_truth_reviewer",
+            "ground_truth_reviewed_at",
+        )
+        missing = [key for key in required_provenance if not metadata.get(key)]
+        if metadata.get("ground_truth_status") != "reviewed" or missing:
+            raise ValueError(
+                "不能仅凭确认选项发布：运行结果必须绑定 reviewed Golden suite；"
+                f"缺少 {', '.join(missing) or 'reviewed status'}。"
+            )
+        if not metadata.get("candidate_suggestion_exercised"):
+            raise ValueError("发布验收没有执行候选建议链路。")
+        if not metadata.get("recovery_exercised"):
+            raise ValueError("发布验收没有执行 checkpoint 恢复链路。")
 
     cases = payload.get("cases", [])
     expected_ids = {case.get("case_id") for case in cases}
@@ -37,6 +55,12 @@ def finalize_annotations(
             raise ValueError(f"{case_id} 的 supported_citations 包含未生成的 URL。")
         if not isinstance(decision.get("task_success"), bool):
             raise ValueError(f"{case_id} 的 task_success 必须是布尔值。")
+        if ground_truth_confirmed and (
+            not case.get("workflow_completed")
+            or case.get("run_error")
+            or not case.get("report_sha256")
+        ):
+            raise ValueError(f"{case_id} 的真实工作流没有成功完成，不能发布。")
         reviewed_cases.append({
             **case,
             "supported_citations": supported,
@@ -83,7 +107,8 @@ def _collect_decisions(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         print(f"成功标准：{context.get('success_criteria', '未记录')}")
         if context.get("run_error"):
             print(f"运行错误：{context['run_error']}")
-        print(f"报告预览：\n{context.get('report_preview', '')}\n")
+        report = context.get("generated_report") or context.get("report_preview", "")
+        print(f"完整报告：\n{report}\n")
 
         supported = []
         for url in case.get("generated_citations", []):

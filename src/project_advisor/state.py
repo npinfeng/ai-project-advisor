@@ -100,6 +100,7 @@ class AgentState(MessagesState):
     # 多轮追问
     clarification_round: int = 0
     max_clarification_rounds: int = 3
+    pending_clarification: str = ""
 
     # 需求解析阶段
     requirements: Optional[Requirements] = None
@@ -118,6 +119,7 @@ class AgentState(MessagesState):
     token_usage: Annotated[dict, token_usage_reducer] = {}
     raw_notes: Annotated[list[str], override_reducer] = []
     evidences: Annotated[list, operator.add] = []
+    tool_executions: Annotated[list[dict], operator.add] = []
     knowledge_stats: dict = {}
 
     # 评分与报告
@@ -125,6 +127,7 @@ class AgentState(MessagesState):
     scores: Annotated[list, operator.add] = []
     review_analysis: str = ""
     review_evidence_gaps: list[str] = []
+    context_budget: dict = {}
     final_report: str = ""
 
 
@@ -138,6 +141,7 @@ class ResearcherState(dict):
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
     evidences: Annotated[list[Evidence], operator.add] = []
+    tool_executions: Annotated[list[dict], operator.add] = []
     token_usage: Annotated[dict, token_usage_reducer] = {}
     next: str = ""
 
@@ -148,4 +152,5 @@ class ResearcherOutputState(BaseModel):
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
     evidences: list[Evidence] = []
+    tool_executions: list[dict] = []
     token_usage: dict = {}

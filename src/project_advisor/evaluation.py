@@ -26,6 +26,9 @@ class EvaluationCase(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0, ge=0)
+    workflow_completed: bool = True
+    run_error: Optional[str] = None
+    report_sha256: Optional[str] = None
 
 
 class EvaluationMetadata(BaseModel):
@@ -44,6 +47,15 @@ class EvaluationMetadata(BaseModel):
     model: Optional[str] = None
     created_at: Optional[str] = None
     notes: Optional[str] = None
+    golden_suite_name: Optional[str] = None
+    golden_suite_version: Optional[str] = None
+    golden_suite_sha256: Optional[str] = None
+    ground_truth_status: Optional[str] = None
+    ground_truth_reviewer: Optional[str] = None
+    ground_truth_reviewed_at: Optional[str] = None
+    candidate_suggestion_exercised: bool = False
+    recovery_exercised: bool = False
+    release_preflight: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvaluationBundle(BaseModel):
@@ -182,6 +194,26 @@ def evaluate_cases(
     ):
         raise ValueError(
             "可发布基线必须来自 real_run，并记录独立人工审核方法和 annotator。"
+        )
+    if metadata.is_publishable and (
+        metadata.ground_truth_status != "reviewed"
+        or not metadata.golden_suite_sha256
+        or not metadata.ground_truth_reviewer
+        or not metadata.ground_truth_reviewed_at
+        or not metadata.candidate_suggestion_exercised
+        or not metadata.recovery_exercised
+    ):
+        raise ValueError(
+            "可发布基线必须绑定已审核 Golden suite，并通过候选建议和 checkpoint 恢复验收。"
+        )
+    failed_runs = [
+        case.case_id
+        for case in cases
+        if not case.workflow_completed or case.run_error or not case.report_sha256
+    ]
+    if metadata.is_publishable and failed_runs:
+        raise ValueError(
+            "以下 case 没有成功完成真实工作流：" + "、".join(failed_runs)
         )
 
     recalls = []

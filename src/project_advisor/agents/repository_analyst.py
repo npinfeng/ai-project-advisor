@@ -4,8 +4,6 @@
 使用 GitHub 工具收集仓库的工程数据并生成分析报告。
 """
 
-import asyncio
-
 from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
@@ -16,8 +14,8 @@ from langchain_core.runnables import RunnableConfig
 from project_advisor.configuration import Configuration
 from project_advisor.prompts import repo_analyst_system_prompt
 from project_advisor.state import ResearcherState
-from project_advisor.tools.evidence_factory import build_evidences_from_tool_result
-from project_advisor.usage_tracking import add_usage, usage_scope
+from project_advisor.tools.execution import ToolExecutionRecord, execute_tool
+from project_advisor.usage_tracking import add_usage
 from project_advisor.utils import (
     create_chat_model,
     get_message_token_usage,
@@ -41,6 +39,7 @@ async def repository_analyst(state: ResearcherState, config: RunnableConfig):
         create_chat_model(
             configurable.research_model,
             max_tokens=configurable.research_model_max_tokens,
+            timeout_seconds=configurable.llm_timeout_seconds,
         )
         .bind_tools(tools)
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
@@ -55,32 +54,6 @@ async def repository_analyst(state: ResearcherState, config: RunnableConfig):
         "tool_call_iterations": state.get("tool_call_iterations", 0) + 1,
         "next": "analyst_tools",
     }
-
-
-async def execute_tool_safely(
-    tool, args, config, *, project_name: str, research_topic: str
-):
-    """安全执行工具，带错误处理和状态码检查。"""
-    if tool is None:
-        return "工具执行出错：未找到对应工具。", [], {
-            "input_tokens": 0,
-            "output_tokens": 0,
-        }
-    try:
-        with usage_scope() as nested_usage:
-            result = await tool.ainvoke(args, config)
-        return str(result), build_evidences_from_tool_result(
-            tool_name=getattr(tool, "name", getattr(tool, "__name__", "unknown")),
-            args=args,
-            result=result,
-            project_name=project_name,
-            research_topic=research_topic,
-        ), dict(nested_usage)
-    except Exception as e:
-        return f"工具执行出错：{str(e)}", [], {
-            "input_tokens": 0,
-            "output_tokens": 0,
-        }
 
 
 async def analyst_tools(state: ResearcherState, config: RunnableConfig):
@@ -99,6 +72,8 @@ async def analyst_tools(state: ResearcherState, config: RunnableConfig):
     executable_calls = [
         tc for tc in most_recent.tool_calls if tc["name"] != "ResearchComplete"
     ]
+    rejected_calls = executable_calls[configurable.max_tool_calls_per_step:]
+    executable_calls = executable_calls[:configurable.max_tool_calls_per_step]
 
     tools = await get_repository_tools(config)
     tools_by_name = {
@@ -110,23 +85,55 @@ async def analyst_tools(state: ResearcherState, config: RunnableConfig):
 
     # 并行执行所有工具调用
     tool_tasks = [
-        execute_tool_safely(
+        execute_tool(
             tools_by_name.get(tc["name"]),
             tc["args"],
             config,
+            call_id=tc["id"],
+            requested_tool_name=tc["name"],
             project_name=project_name,
             research_topic=research_topic,
         )
         for tc in executable_calls
     ]
+    import asyncio
+
     observations = await asyncio.gather(*tool_tasks)
 
     tool_messages = [
-        ToolMessage(content=obs[0], name=tc["name"], tool_call_id=tc["id"])
+        ToolMessage(
+            content=obs.observation,
+            name=tc["name"],
+            tool_call_id=tc["id"],
+        )
         for obs, tc in zip(observations, executable_calls)
     ]
-    evidences = [evidence for _, batch, _ in observations for evidence in batch]
-    nested_usage = add_usage(*(usage for _, _, usage in observations))
+    evidences = [evidence for obs in observations for evidence in obs.evidences]
+    nested_usage = add_usage(*(obs.token_usage for obs in observations))
+    execution_records = [obs.record.model_dump() for obs in observations]
+    tool_messages.extend(
+        ToolMessage(
+            content="工具调用被拒绝：单轮调用数量超过安全上限。",
+            name=tc["name"],
+            tool_call_id=tc["id"],
+        )
+        for tc in rejected_calls
+    )
+    execution_records.extend(
+        ToolExecutionRecord(
+            tool_name=tc["name"],
+            agent_run_id=str(
+                config.get("configurable", {}).get("thread_id", "")
+            ),
+            call_id=tc["id"],
+            project_name=project_name,
+            status="rejected",
+            latency_ms=0,
+            retry_count=0,
+            error_type="ToolCallLimitExceeded",
+        ).model_dump()
+        for tc in rejected_calls
+    )
     tool_messages.extend(
         ToolMessage(
             content="研究完成信号已确认。",
@@ -144,6 +151,7 @@ async def analyst_tools(state: ResearcherState, config: RunnableConfig):
         return {
             "researcher_messages": tool_messages,
             "evidences": evidences,
+            "tool_executions": execution_records,
             "token_usage": nested_usage,
             "next": "compress_research",
         }
@@ -151,6 +159,7 @@ async def analyst_tools(state: ResearcherState, config: RunnableConfig):
     return {
         "researcher_messages": tool_messages,
         "evidences": evidences,
+        "tool_executions": execution_records,
         "token_usage": nested_usage,
         "next": "repository_analyst",
     }

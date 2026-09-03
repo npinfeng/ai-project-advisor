@@ -20,6 +20,8 @@ from project_advisor.rag.vector_store import VectorStore
 
 # 时间衰减半衰期（天）：超过此天数的文档 RRF 得分衰减至一半
 TIME_DECAY_HALF_LIFE_DAYS = 90
+DEFAULT_CANDIDATE_POOL_FACTOR = 4
+DEFAULT_MIN_RESULTS_PER_SOURCE = 1
 
 
 def _compute_time_decay(
@@ -118,6 +120,141 @@ def reciprocal_rank_fusion(
     ]
 
 
+def _normalize_result_scores(results: list[dict]) -> list[float]:
+    """Normalize one retriever's scores to 0..1 within that source."""
+    if not results:
+        return []
+    raw_scores = []
+    for item in results:
+        try:
+            value = float(item.get("score", 0.0))
+        except (TypeError, ValueError):
+            value = 0.0
+        raw_scores.append(value if math.isfinite(value) else 0.0)
+    minimum = min(raw_scores)
+    maximum = max(raw_scores)
+    if math.isclose(maximum, minimum):
+        return [1.0 if maximum > 0 else 0.0] * len(raw_scores)
+    scale = maximum - minimum
+    return [(value - minimum) / scale for value in raw_scores]
+
+
+def score_rank_fusion(
+    result_lists: list[list[dict]],
+    *,
+    source_names: Optional[list[str]] = None,
+    weight_vector: Optional[list[float]] = None,
+    rank_weight: float = 0.5,
+    score_weight: float = 0.5,
+    rrf_k: int = 60,
+    enable_time_decay: bool = True,
+) -> list[dict]:
+    """Fuse independently normalized scores with normalized rank evidence."""
+    if not result_lists:
+        return []
+    source_names = source_names or [
+        f"source_{index}" for index in range(len(result_lists))
+    ]
+    weight_vector = weight_vector or [1.0] * len(result_lists)
+    if len(source_names) != len(result_lists) or len(weight_vector) != len(result_lists):
+        raise ValueError("source names, weights, and result lists must have equal length")
+    if rank_weight < 0 or score_weight < 0 or math.isclose(rank_weight + score_weight, 0):
+        raise ValueError("rank and score weights must be non-negative with a positive sum")
+    if any(weight < 0 for weight in weight_vector) or math.isclose(sum(weight_vector), 0):
+        raise ValueError("source weights must be non-negative with a positive sum")
+
+    source_total = sum(weight_vector)
+    component_total = rank_weight + score_weight
+    source_weights = [weight / source_total for weight in weight_vector]
+    normalized_rank_weight = rank_weight / component_total
+    normalized_score_weight = score_weight / component_total
+    entries: dict[str, dict] = {}
+
+    for list_index, results in enumerate(result_lists):
+        source_name = source_names[list_index]
+        source_weight = source_weights[list_index]
+        normalized_scores = _normalize_result_scores(results)
+        for rank, (item, normalized_score) in enumerate(
+            zip(results, normalized_scores), start=1
+        ):
+            document_id = str(item.get("id", f"unknown_{list_index}_{rank}"))
+            entry = entries.setdefault(document_id, {
+                "item": item,
+                "hybrid_score": 0.0,
+                "rrf_score": 0.0,
+                "fusion_sources": [],
+                "source_ranks": {},
+                "source_scores": {},
+            })
+            normalized_rank = (rrf_k + 1) / (rrf_k + rank)
+            entry["hybrid_score"] += source_weight * (
+                normalized_rank_weight * normalized_rank
+                + normalized_score_weight * normalized_score
+            )
+            entry["rrf_score"] += source_weight / (rrf_k + rank)
+            entry["fusion_sources"].append(source_name)
+            entry["source_ranks"][source_name] = rank
+            entry["source_scores"][source_name] = normalized_score
+
+    for entry in entries.values():
+        retrieved_at = entry["item"].get("metadata", {}).get("retrieved_at", "")
+        decay = _compute_time_decay(retrieved_at) if enable_time_decay else 1.0
+        entry["hybrid_score"] *= decay
+        entry["rrf_score"] *= decay
+        entry["time_decay"] = decay
+
+    ranked = sorted(
+        entries.values(),
+        key=lambda entry: (entry["hybrid_score"], entry["rrf_score"]),
+        reverse=True,
+    )
+    return [
+        {
+            **entry["item"],
+            "hybrid_score": entry["hybrid_score"],
+            "rrf_score": entry["rrf_score"],
+            "time_decay": entry["time_decay"],
+            "fusion_sources": entry["fusion_sources"],
+            "source_ranks": entry["source_ranks"],
+            "source_scores": entry["source_scores"],
+        }
+        for entry in ranked
+    ]
+
+
+def _select_with_source_quotas(
+    ranked: list[dict],
+    result_lists: list[list[dict]],
+    *,
+    top_k: int,
+    min_results_per_source: int,
+) -> list[dict]:
+    """Preserve each retriever's strongest evidence, then fill by fused rank."""
+    if top_k < 1 or not ranked:
+        return []
+    available_ids = {str(item.get("id")) for item in ranked}
+    required_ids: list[str] = []
+    if min_results_per_source > 0 and top_k >= len(result_lists):
+        for results in result_lists:
+            source_added = 0
+            for item in results:
+                document_id = str(item.get("id", ""))
+                if not document_id or document_id not in available_ids:
+                    continue
+                if document_id not in required_ids:
+                    required_ids.append(document_id)
+                source_added += 1
+                if source_added >= min_results_per_source:
+                    break
+
+    selected_ids = set(required_ids[:top_k])
+    for item in ranked:
+        if len(selected_ids) >= top_k:
+            break
+        selected_ids.add(str(item.get("id")))
+    return [item for item in ranked if str(item.get("id")) in selected_ids][:top_k]
+
+
 class HybridRetriever:
     """混合检索器 — BM25 + 向量 + RRF 融合。
 
@@ -133,8 +270,12 @@ class HybridRetriever:
         chunker: Optional[DocumentChunker] = None,
         vector_store: Optional[VectorStore] = None,
         bm25: Optional[BM25Retriever] = None,
-        vector_weight: float = 0.6,
-        bm25_weight: float = 0.4,
+        vector_weight: float = 0.5,
+        bm25_weight: float = 0.5,
+        rank_weight: float = 0.5,
+        score_weight: float = 0.5,
+        candidate_pool_factor: int = DEFAULT_CANDIDATE_POOL_FACTOR,
+        min_results_per_source: int = DEFAULT_MIN_RESULTS_PER_SOURCE,
     ):
         """初始化混合检索器。
 
@@ -152,6 +293,10 @@ class HybridRetriever:
         self.bm25 = bm25 or BM25Retriever()
         self.vector_weight = vector_weight
         self.bm25_weight = bm25_weight
+        self.rank_weight = rank_weight
+        self.score_weight = score_weight
+        self.candidate_pool_factor = max(2, candidate_pool_factor)
+        self.min_results_per_source = max(0, min_results_per_source)
 
     def index_documents(
         self,
@@ -227,10 +372,11 @@ class HybridRetriever:
         """
         # 1. 向量检索
         query_embedding = self.embedder.embed(query)
+        candidate_count = max(top_k, top_k * self.candidate_pool_factor)
         vector_results = self.vector_store.search(
             query_embedding,
             project_name=project_name,
-            top_k=top_k * 2,  # 多取一些供融合
+            top_k=candidate_count,
             filter_metadata=filter_metadata,
         )
 
@@ -238,16 +384,23 @@ class HybridRetriever:
         bm25_results = self.bm25.search(
             query,
             project_name=project_name,
-            top_k=top_k * 2,
+            top_k=candidate_count,
         )
 
-        # 3. RRF 融合
-        fused = reciprocal_rank_fusion(
+        # 3. 分数归一化 + 排名融合，并保留两路检索的最低候选配额
+        fused = score_rank_fusion(
             [vector_results, bm25_results],
+            source_names=["vector", "bm25"],
             weight_vector=[self.vector_weight, self.bm25_weight],
+            rank_weight=self.rank_weight,
+            score_weight=self.score_weight,
         )
-
-        return fused[:top_k]
+        return _select_with_source_quotas(
+            fused,
+            [vector_results, bm25_results],
+            top_k=top_k,
+            min_results_per_source=self.min_results_per_source,
+        )
 
     def clear(self, project_name: str):
         """清除项目的所有索引。"""

@@ -10,11 +10,10 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
     "langgraph>=0.5.4",
+    "langgraph-checkpoint-sqlite>=3.1.0",
     "langchain>=0.3.0",
-    "langchain-openai>=0.3.28",
     "langchain-anthropic>=0.3.15",
     "langchain-tavily",
-    "openai>=1.99.2",
     "tavily-python>=0.5.0",
     "httpx>=0.24.0",
     "python-dotenv>=1.0.1",
@@ -35,6 +34,7 @@ dependencies = [
 project-advisor-web = "project_advisor.app:main"
 project-advisor-mcp = "project_advisor.mcp_server:main"
 project-advisor-eval = "project_advisor.evaluation:main"
+project-advisor-rag-benchmark = "project_advisor.rag.benchmark:main"
 
 [project.optional-dependencies]
 dev = ["pytest", "mypy>=1.11.1", "ruff>=0.6.1"]

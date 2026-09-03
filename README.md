@@ -5,19 +5,22 @@
 ## 核心能力
 
 - 专业化 Agent：Repository Analyst 和 Documentation Researcher 使用相互隔离的工具集。
+- 有界 Tool Runtime：统一参数校验、超时、瞬时错误重试、单轮 fan-out 上限和结构化执行记录。
 - 受限 Reviewer：只能读取规范化 Evidence，不具备工具权限，也不能决定权重和最终排名。
 - 证据驱动：统一 `Evidence` 模型记录来源、时间、版本、置信度与评估维度。
 - 确定性评分：LLM 负责分析证据，程序按配置权重计算最终分数和排名。
 - Hybrid RAG：BM25、向量检索、RRF 融合、查询改写和 Reranker。
 - MCP：内置真实 stdio Server，并支持服务端配置额外 stdio / HTTP Server。
-- Web 应用：FastAPI + SSE 推送阶段进度，支持停止、复制和下载报告。
+- Web 应用：FastAPI + SSE 推送阶段进度，支持停止、恢复、复制和下载报告。
+- 可恢复工作流：SQLite 保存 LangGraph checkpoint 和任务状态，支持多轮澄清、候选确认与服务重启后继续。
 - 可观测性：页面展示总耗时、阶段耗时、候选数、引用数、MCP 状态、Token 和成本。
+- 关联日志：并发运行时通过 ContextVar 隔离 `task_id`、`research_task_id`、候选项目和 Tool Call 上下文。
 - 离线评测：覆盖检索、引用、任务成功率、延迟、Token 与成本指标。
 
 ## 架构
 
 ```text
-用户需求
+用户需求 ──► 可选多轮澄清 ──► 候选确认
   │
   ▼
 已确认的结构化计划
@@ -41,7 +44,7 @@
                  FastAPI / SSE / 运行诊断面板
 ```
 
-候选预览可以使用一次结构化模型调用，但不进入运行期 Agent 循环。执行阶段直接复用已确认计划；手动候选模式则由程序生成固定七维计划。每个研究员仍有工具调用上限，补充研究固定最多一轮。
+候选预览可以使用一次结构化模型调用，但不进入运行期 Agent 循环。执行阶段直接复用已确认计划；手动候选模式会在执行前生成一次结构化需求计划，再用用户指定的候选项目覆盖模型建议，避免丢失语言、部署、预算和硬性能力等约束。每个研究员仍有工具调用上限，补充研究固定最多一轮。
 
 ## 快速开始
 
@@ -54,6 +57,10 @@ Copy-Item .env.example .env
 ```
 
 编辑 `.env`，至少配置所选模型对应的 API Key。默认模型为 `deepseek:deepseek-chat`，需要 `DEEPSEEK_API_KEY`。
+
+DeepSeek 和 OpenAI 通过项目内置的纯 HTTPX Chat Completions 客户端接入，
+不依赖 OpenAI SDK 的原生 `jiter` 扩展，适用于启用了 Windows App Control
+或 WDAC 的环境。升级代码后需要重启 Web 服务，正在运行的旧进程不会自动加载新客户端。
 
 启动 Web 服务：
 
@@ -71,9 +78,15 @@ C:\miniconda\envs\agent\python.exe -m uvicorn project_advisor.app:app --host 127
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/health` | 服务健康检查 |
+| `GET` | `/api/health` | 服务和模型运行时健康检查 |
+| `POST` | `/api/candidates/suggest` | 生成结构化需求与候选预览 |
 | `POST` | `/api/advice/stream` | SSE 技术评估流 |
+| `GET` | `/api/tasks` | 最近任务列表 |
+| `GET` | `/api/tasks/{task_id}` | 任务状态、等待输入与已完成报告 |
+| `POST` | `/api/tasks/{task_id}/resume` | 提交澄清/候选确认，或恢复暂停任务 |
 | `GET` | `/api/evaluation` | 最新离线评测基线 |
+
+`/api/health` 在 Web 服务可访问但模型运行时缺少配置时返回 `status=degraded`；页面会显示“服务在线 · 模型未配置”，避免把进程存活误报为完整可用。
 
 默认服务只绑定 `127.0.0.1`。如果暴露到局域网或公网，必须配置
 `ADVISOR_API_KEY`，并在反向代理层继续启用 TLS 和访问控制。高成本接口还受
@@ -117,23 +130,37 @@ Research Agent 不再接收全部 MCP 工具。只有工具名出现在对应角
 
 研究工具产生的结构化 `Evidence` 会自动写入 `data/documents`，供后续任务复用。检索层包含：
 
-- JSON `DocumentStore`：按稳定 Evidence ID 去重，同一 URL 的内容发生变化时保留新版本；
+- JSON `DocumentStore`：按稳定 Evidence ID 去重；同一 URL 内容变化时保留历史版本供审计，检索只使用最新版本；
 - ChromaDB：使用稳定 chunk ID 幂等写入，进程重启后自动发现已有项目 Collection；
 - 持久化 BM25：保存分块文本和元数据，重启后恢复关键词索引；
 - Hybrid RAG：向量与 BM25 使用同一 chunk ID，经 RRF 合并时不会重复计算同一文档；
 - 自动同步：`rag_search` 会先把尚未索引的历史 Evidence 同步到两路索引；
-- 手动维护：`rag_ingest` 同步指定项目，`rag_rebuild` 可在分块或嵌入配置变化后强制重建索引。
+- 生命周期：Evidence 分为 active/stale/expired/invalid；expired 和非法 URL 不进入索引；
+- 手动维护：`rag_ingest` 同步指定项目，`rag_rebuild` 强制重建；`rag_maintain` 默认只预览，显式 `apply=true` 才清理 expired/invalid 数据并重建受影响索引。
 
-这里持久化的是研究证据与知识，不是用户对话偏好；跨会话聊天记忆仍需后续接入 LangGraph Checkpointer 或独立记忆服务。
+Reviewer 会按来源权威性、新鲜度和置信度选择证据，压缩重复内容，并严格遵守总字符预算。预算和生命周期阈值可通过 `REVIEWER_CONTEXT_MAX_CHARS`、`REVIEWER_EVIDENCE_MAX_CHARS`、`EVIDENCE_STALE_AFTER_DAYS`、`EVIDENCE_EXPIRE_AFTER_DAYS` 配置；裁剪详情写入运行诊断与报告证据缺口。
+
+### 任务与 checkpoint
+
+Web 服务启动时还会初始化两份本地 SQLite 数据：
+
+- `data/checkpoints.sqlite3`：LangGraph 节点状态和中断点，使用 `task_id` 作为 `thread_id`；
+- `data/tasks.sqlite3`：任务列表、状态、待处理交互、诊断数据和最终报告。
+
+勾选“允许交互式澄清”后，工作流可以在需求不足时暂停并等待补充，也会在研究前要求确认候选项目。浏览器刷新或服务重启后，可从最近任务列表继续同一个任务。路径可通过 `CHECKPOINT_DB_PATH` 和 `TASK_DB_PATH` 修改。
+
+SQLite 适合本地演示和单机部署；多实例生产部署应替换为共享的 PostgreSQL checkpointer 与任务存储。持久化内容用于恢复任务上下文，不会自动推断或长期保存用户偏好。
 
 ## 运行诊断
 
 每个 SSE `progress` 事件包含当前阶段耗时，最终 `result` 事件包含：
 
-- 总耗时与七个工作流阶段耗时（未触发的补充研究显示为跳过）；
+- 总耗时与各工作流阶段耗时（未触发的补充研究显示为跳过）；
 - 候选项目数量和报告中唯一引用 URL 数；
 - MCP 的连接状态、Server 数量和工具数量；
 - 模型返回的输入、输出与总 Token；
+- Tool 成功/失败/超时数量、重试次数与累计执行耗时；
+- Reviewer 上下文预算使用量、重复压缩、截断和低优先级证据丢弃数量；
 - 按 `INPUT_PRICE_PER_MILLION`、`OUTPUT_PRICE_PER_MILLION` 计算的成本。
 
 只有模型响应提供 usage 元数据时才显示 Token；只有显式配置单价时才显示成本，缺失数据不会被估算成真实值。
@@ -144,7 +171,8 @@ Research Agent 不再接收全部 MCP 工具。只有工具名出现在对应角
 
 - `evals/sample_results.json`：3 个 Case 的公式测试夹具，状态为 `FIXTURE`。
 - `evals/real_results.json`：10 个 Case 的模拟演示数据，状态为 `DEMO`；名称为兼容旧配置而保留，不代表真实运行基线。
-- `evals/golden_cases.json`：运行前写好的 6 个真实评测题目、候选项目、相关文档、期望引用和成功标准。当前 ground truth 仍需人工复核。
+- `evals/golden_cases.json`：运行前写好的 6 个真实评测题目、候选项目、相关文档、期望引用和成功标准。它仍是 draft，发布采集默认拒绝使用。
+- `evals/golden_cases.reviewed.json`：由独立审核人逐 Case 核对后生成；不会由程序自动批准或覆盖 draft。
 
 ### 模拟演示指标（10 Case，`K=5`）
 
@@ -173,24 +201,37 @@ C:\miniconda\envs\agent\python.exe -m project_advisor.evaluation --input evals\r
 
 ### 生成并审核真实运行数据
 
-先启动 Web 服务，再按以下闭环执行：
+先启动 Web 服务，再按以下闭环执行。发布链路默认采用 fail-closed：草稿标签、缺少真实模型、服务降级、没有候选建议预检、没有 checkpoint 恢复、运行错误或缺少人工审核，任一情况都会阻止发布。
 
 ```powershell
-# 1. 执行预先定义的 6 个 Case；只采集实际 Evidence、报告、延迟、Token 和成本
-C:\miniconda\envs\agent\python.exe scripts\capture_eval_results.py
+# 1. 由独立审核人逐项核对 Golden Case；输出新文件，不修改原 draft
+C:\miniconda\envs\agent\python.exe scripts\review_golden_cases.py `
+  --reviewer "审核人姓名"
 
-# 2. 独立人工核对引用支持情况和任务成功标准
+# 2. 对 reviewed suite 运行真实 API 验收并采集实际 Evidence、报告、延迟、Token 和成本
+#    预检会调用 health、候选建议；首个 Case 会经过 candidate_confirmation 中断与恢复
+C:\miniconda\envs\agent\python.exe scripts\capture_eval_results.py `
+  --suite evals\golden_cases.reviewed.json
+
+# 3. 人工独立核对生成引用与任务成功标准
 C:\miniconda\envs\agent\python.exe scripts\annotate_eval_results.py `
   --input evals\runs\run-时间戳.pending.json `
   --annotator "审核人姓名"
 
-# 3. 仅对通过来源与人工审核门禁的文件生成正式指标
-C:\miniconda\envs\agent\python.exe -m project_advisor.evaluation `
-  --input evals\runs\run-时间戳.reviewed.json `
-  --require-publishable
+# 4. 校验运行结果绑定的是同一份 reviewed suite，并执行发布质量阈值
+C:\miniconda\envs\agent\python.exe scripts\verify_release_acceptance.py `
+  --suite evals\golden_cases.reviewed.json `
+  --run evals\runs\run-时间戳.reviewed.json `
+  --min-recall 0.80 `
+  --min-citation-accuracy 0.80 `
+  --min-citation-coverage 0.80 `
+  --min-task-success 0.80 `
+  --output evals\real_baseline_report.json
 ```
 
-采集脚本不会自动填写 `supported_citations` 或 `task_success`。只有 `real_run`、`reviewed`、`independent_human`、具名审核人且已确认 golden ground truth 的文件，才能标记为 `is_publishable=true`。
+采集脚本不会自动填写 `supported_citations` 或 `task_success`。只有 `real_run`、`reviewed`、`independent_human`、具名审核人、精确 Golden suite SHA-256、健康预检、候选建议和恢复链路全部存在时，文件才能标记为 `is_publishable=true`。发布验收还会检查 Case 集合完全一致及质量阈值。
+
+`--allow-draft-suite`、`--skip-preflight` 和 `--skip-recovery-check` 只用于开发排障；使用这些选项产生的运行不能通过正式发布门禁。API 启用 `ADVISOR_API_KEY` 时，采集脚本会从环境变量读取并通过请求头发送，不会写入评测文件。
 
 真实运行的 SSE 结果包含 `retrieved_evidences`，每条记录使用工作流实际产生的 `evidence_id` 和 `source_url`。评测脚本不再从报告标题推测检索文档，也不再把检索结果复制进相关文档标签。
 
@@ -218,7 +259,7 @@ C:\miniconda\envs\agent\python.exe -m pytest tests -v -p no:cacheprovider
 ```
 
 MCP 集成测试会实际启动内置 stdio Server、发现工具并调用 `estimate_llm_cost`，不是 Mock 测试。
-当前完整回归结果为 `32 passed`。测试覆盖专业化工具隔离、确定性任务展开、单次补充研究门禁、无模型报告渲染、Evidence 重启恢复、BM25/Chroma 持久化、SSE 真实 Evidence 采集和可信评测闭环。
+当前完整回归结果为 `73 passed`。测试覆盖专业化工具隔离、Tool 参数校验/超时/重试/fan-out 限制、Agent Run 端到端超时、Reviewer 上下文预算、RAG 五组消融、Evidence 生命周期与版本冲突、Golden Case 独立审核门禁、真实发布预检与套件哈希绑定、异步 RAG、Reranker 并发闸门、日志上下文隔离、领域异常映射、确定性任务展开、单次补充研究门禁、手动候选结构化计划、健康状态降级、无模型报告渲染、Evidence 重启恢复、SQLite checkpoint/任务存储恢复、孤儿任务恢复、SSE 中断恢复、BM25/Chroma 持久化、SSE 真实 Evidence 采集和可信评测闭环。
 
 ## 故障降级演示
 
@@ -226,23 +267,43 @@ MCP 集成测试会实际启动内置 stdio Server、发现工具并调用 `esti
 - 设置 `MCP_REQUIRED=true`：MCP 不可用时任务明确失败。
 - 临时移除搜索 API Key：可以演示工具错误如何进入 SSE `error`，且浏览器不会展示服务端堆栈。
 - 使用 `EVALUATION_FILE` 指向不存在的文件：评测看板显示不可用，主评估流程不受影响。
+- 如果日志出现 `jiter ... 应用程序控制策略已阻止此文件`：确认已更新到当前代码并重启 Web 服务；
+  `/api/health` 的 `model_runtime.client` 应显示 `OpenAICompatibleChatModel`。
+
+## 已知限制
+
+- SQLite checkpoint 和任务库面向单机部署；多实例服务需要共享 checkpointer 与任务存储。
+- 长期知识库存储的是可复用 Evidence，不是用户画像；当前没有跨会话偏好记忆。
+- Token/成本门禁依赖模型提供 usage；Provider 不返回 usage 时只能执行时间、步骤和并发预算。
+- Web 速率限制与并发计数保存在单进程内存中，多实例部署需要由网关或共享存储统一执行。
+- Golden Case 已与运行结果分离，但正式发布质量基线仍需要独立人工复核 ground truth。
+
+## 后续演进
+
+1. 为真实 Golden Case 完成人工标注并在 CI 中加入可发布评测门禁。
+2. 增加 OpenTelemetry Trace Exporter，把现有 task/node/tool 诊断接入外部可观测平台。
+3. 若部署扩展到多实例，再将 SQLite 和进程内限流替换为共享基础设施；当前阶段不提前引入 Redis/PostgreSQL。
 
 ## 项目结构
 
 ```text
 src/project_advisor/
+├── api/             # FastAPI 请求 Schema
 ├── agents/          # Planner、Researcher、Reviewer
+├── observability/   # 关联日志、Token/耗时/成本诊断
 ├── rag/             # Hybrid RAG
 ├── schemas/         # Evidence、评分与结构化结果
 ├── static/          # Web 页面、样式和交互
 ├── tools/           # GitHub、搜索、文档、评分、引用
 ├── app.py           # FastAPI、SSE、诊断与评测 API
 ├── graph.py         # LangGraph 主图和子图
+├── persistence.py   # SQLite 任务状态存储
 ├── mcp_client.py    # MCP 动态发现与降级
 ├── mcp_server.py    # 内置 FastMCP stdio Server
-└── evaluation.py    # 离线评测指标与 CLI
+├── evaluation.py    # 离线评测指标与 CLI
+└── errors.py        # 领域异常层级
 ```
 
 ## 许可证
 
-MIT
+[MIT](LICENSE)

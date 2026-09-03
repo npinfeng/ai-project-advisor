@@ -6,6 +6,8 @@ from typing import Optional
 import httpx
 from langchain_core.tools import tool
 
+from project_advisor import __version__
+
 GITHUB_API_BASE = "https://api.github.com"
 
 
@@ -13,7 +15,7 @@ def _get_headers() -> dict[str, str]:
     """构建 GitHub API 请求头。"""
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "project-advisor/0.1.0",
+        "User-Agent": f"project-advisor/{__version__}",
     }
     token = os.getenv("GITHUB_TOKEN")
     if token:

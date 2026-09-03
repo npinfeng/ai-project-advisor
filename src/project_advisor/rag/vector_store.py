@@ -166,12 +166,18 @@ class VectorStore:
             metadatas.append(self._metadata_for_chroma(metadata))
             embeds.append(embedding)
 
-        collection.upsert(
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas,
-            embeddings=embeds,
+        get_max_batch_size = getattr(self._client, "get_max_batch_size", None)
+        max_batch_size = (
+            int(get_max_batch_size()) if callable(get_max_batch_size) else 5000
         )
+        for start in range(0, len(ids), max_batch_size):
+            end = start + max_batch_size
+            collection.upsert(
+                ids=ids[start:end],
+                documents=documents[start:end],
+                metadatas=metadatas[start:end],
+                embeddings=embeds[start:end],
+            )
         return len(ids)
 
     def search(
@@ -268,3 +274,9 @@ class VectorStore:
             return 0
         collection.delete(ids=sorted(document_ids))
         return len(document_ids)
+
+    def close(self) -> None:
+        """Release Chroma resources, including Windows file handles."""
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()

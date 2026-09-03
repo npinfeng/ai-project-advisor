@@ -66,6 +66,12 @@ button { color: inherit; }
 .service-status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #a5aaa8; box-shadow: 0 0 0 5px rgba(98, 113, 109, 0.09); }
 .service-status.online .status-dot { background: var(--green); box-shadow: 0 0 0 5px rgba(31, 107, 85, 0.12); }
+.service-status.degraded .status-dot { background: var(--accent); box-shadow: 0 0 0 5px rgba(232, 93, 63, 0.12); }
+.clarification-option { display: flex; align-items: flex-start; gap: 10px; margin: 14px 0; padding: 13px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.38); cursor: pointer; }
+.clarification-option input { margin-top: 3px; accent-color: var(--green); }
+.clarification-option strong, .clarification-option small { display: block; }
+.clarification-option small { margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.clarification-option.disabled { opacity: .5; cursor: not-allowed; }
 
 .hero {
   min-height: 380px;
@@ -163,6 +169,11 @@ textarea:focus, input:focus { border-color: rgba(31,107,85,.65); box-shadow: 0 0
 .radar i { position: absolute; inset: 50%; width: 5px; height: 5px; border-radius: 50%; background: var(--green); transform: translate(-50%,-50%); }
 .radar i:nth-child(2) { width: 22px; height: 22px; background: transparent; border: 1px solid rgba(31,107,85,.22); }
 .radar i:nth-child(3) { width: 36px; height: 36px; background: transparent; border: 1px solid rgba(31,107,85,.12); }
+.interaction-card { margin-top: 18px; padding: 18px; border: 1px solid rgba(232,93,63,.3); border-radius: 16px; background: rgba(232,93,63,.07); }
+.interaction-card h3 { margin: 8px 0; font: 600 19px/1.25 Georgia, "Songti SC", serif; }
+.interaction-card p { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.interaction-card textarea { width: 100%; resize: vertical; }
+.interaction-card button { margin-top: 10px; }
 
 .results { margin-top: 22px; padding: 36px; border-radius: 26px; background: #10231f; color: #edf3ef; box-shadow: var(--shadow); }
 .results-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; padding-bottom: 25px; border-bottom: 1px solid rgba(255,255,255,.12); }
@@ -174,6 +185,12 @@ textarea:focus, input:focus { border-color: rgba(31,107,85,.65); box-shadow: 0 0
 .evaluation-heading, .diagnostics-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .evaluation-heading h2 { margin: 9px 0 6px; font: 600 28px/1.2 Georgia, "Songti SC", serif; }
 .evaluation-heading p { margin: 0; color: var(--muted); font-size: 11px; }
+.task-history-list { display: grid; gap: 10px; margin-top: 20px; }
+.task-history-item { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; padding: 14px 16px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.42); }
+.task-history-item strong, .task-history-item small { display: block; }
+.task-history-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-history-item small { margin-top: 5px; color: var(--muted); font-size: 9px; }
+.task-history-item button { white-space: nowrap; }
 .metric-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 24px; }
 .metric-card { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 15px; background: rgba(255,255,255,.42); }
 .metric-card span, .metric-card strong { display: block; }

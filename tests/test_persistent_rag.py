@@ -128,3 +128,23 @@ def test_hybrid_indexes_are_idempotent_and_restore_across_restart(tmp_path):
     assert second_stats["vector_total"] == first_stats["chunks"]
     assert results
     assert len({result["id"] for result in results}) == len(results)
+
+
+def test_vector_store_batches_upserts_above_client_limit(tmp_path):
+    vector_store = VectorStore(storage_dir=str(tmp_path / "vector-batches"))
+    vector_store._client.get_max_batch_size = lambda: 2
+    chunks = [
+        {
+            "id": f"chunk-{index}",
+            "text": f"document {index}",
+            "metadata": {"chunk_id": f"chunk-{index}"},
+        }
+        for index in range(5)
+    ]
+    embeddings = [[float(index), 0.0, 1.0] for index in range(5)]
+
+    try:
+        assert vector_store.add_documents("BatchProject", chunks, embeddings) == 5
+        assert vector_store.count("BatchProject") == 5
+    finally:
+        vector_store.close()

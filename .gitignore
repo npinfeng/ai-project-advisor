@@ -9,11 +9,13 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.md
+!docs/rag_benchmark.md
 
 .venv/
 venv/
 dist/
 build/
+artifacts/
 
 data/
 evals/runs/*.pending.json

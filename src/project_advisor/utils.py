@@ -1,12 +1,10 @@
 """实用工具函数 — 搜索、模型管理、日期处理等。"""
 
 import os
-import logging
 import asyncio
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
-from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, filter_messages
 from langchain_core.runnables import RunnableConfig
@@ -14,6 +12,73 @@ from langchain_core.tools import tool
 from tavily import AsyncTavilyClient
 
 from project_advisor.configuration import Configuration, SearchAPI
+from project_advisor.errors import ModelConfigurationError, StructuredOutputError
+
+
+def is_retryable_model_error(error: Exception) -> bool:
+    """Classify transient provider failures without retrying bad input or auth."""
+    import httpx
+
+    if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException, httpx.TransportError)):
+        return True
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code == 429 or status_code >= 500
+    message = str(error).casefold()
+    return any(marker in message for marker in (
+        "rate limit",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    ))
+
+
+async def invoke_structured_with_retry(
+    model: Any,
+    messages: list[Any],
+    *,
+    max_attempts: int,
+    backoff_seconds: float = 0.25,
+    on_raw: Callable[[Any], None] | None = None,
+) -> tuple[Any, list[Any]]:
+    """Invoke an include_raw structured model with one total retry budget."""
+    attempts = max(1, int(max_attempts))
+    raw_responses: list[Any] = []
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            envelope = await model.ainvoke(messages)
+            if not isinstance(envelope, dict):
+                raise TypeError("结构化模型必须返回 include_raw envelope。")
+            raw = envelope.get("raw")
+            raw_responses.append(raw)
+            if on_raw is not None:
+                on_raw(raw)
+            parsed = envelope.get("parsed")
+            if parsed is not None:
+                return parsed, raw_responses
+            parsing_error = envelope.get("parsing_error")
+            last_error = (
+                parsing_error
+                if isinstance(parsing_error, Exception)
+                else ValueError("模型输出未通过结构化 Schema 校验。")
+            )
+        except Exception as error:
+            last_error = error
+            if not is_retryable_model_error(error):
+                raise
+
+        if attempt < attempts - 1 and backoff_seconds:
+            await asyncio.sleep(backoff_seconds * (2**attempt))
+
+    raise StructuredOutputError(
+        f"模型在 {attempts} 次尝试后仍未返回有效结构化输出。"
+    ) from last_error
 
 
 # ===== 日期工具 =====
@@ -35,6 +100,7 @@ def create_chat_model(
     model_spec: str,
     *,
     max_tokens: int = 4096,
+    timeout_seconds: float = 60.0,
 ) -> BaseChatModel:
     """创建 Chat Model 实例，直接支持 DeepSeek、OpenAI、Anthropic。
 
@@ -49,7 +115,7 @@ def create_chat_model(
         DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL（默认 https://api.deepseek.com）
     """
     if ":" not in model_spec:
-        raise ValueError(
+        raise ModelConfigurationError(
             f"模型格式错误：'{model_spec}'，应为 '<provider>:<model_name>'，"
             f"如 'deepseek:deepseek-chat'"
         )
@@ -57,20 +123,31 @@ def create_chat_model(
     provider, _, model_name = model_spec.partition(":")
 
     if provider == "deepseek":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
+        from project_advisor.openai_compatible_chat import OpenAICompatibleChatModel
+
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise ModelConfigurationError("DEEPSEEK_API_KEY 未设置，请检查 .env 文件。")
+        return OpenAICompatibleChatModel(
             model=model_name,
             base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            api_key=api_key,
             max_tokens=max_tokens,
-            extra_body={"thinking": {"type": "disabled"}},
+            timeout_seconds=timeout_seconds,
+            default_extra_body={"thinking": {"type": "disabled"}},
         )
     elif provider == "openai":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
+        from project_advisor.openai_compatible_chat import OpenAICompatibleChatModel
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ModelConfigurationError("OPENAI_API_KEY 未设置，请检查 .env 文件。")
+        return OpenAICompatibleChatModel(
             model=model_name,
-            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            api_key=api_key,
             max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
         )
     elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
@@ -78,9 +155,10 @@ def create_chat_model(
             model=model_name,
             api_key=os.getenv("ANTHROPIC_API_KEY"),
             max_tokens=max_tokens,
+            timeout=timeout_seconds,
         )
     else:
-        raise ValueError(
+        raise ModelConfigurationError(
             f"不支持的模型提供商：'{provider}'，当前支持：deepseek, openai, anthropic"
         )
 
@@ -288,11 +366,23 @@ async def get_documentation_tools(config: RunnableConfig) -> list[Any]:
 
 async def get_all_tools(config: RunnableConfig) -> list[Any]:
     """Compatibility inventory; Research Agents must use their scoped factories."""
-    from project_advisor.tools.rag_search import rag_ingest, rag_rebuild, rag_status
+    from project_advisor.tools.rag_search import (
+        rag_ingest,
+        rag_maintain,
+        rag_rebuild,
+        rag_status,
+    )
 
     repository_tools = await get_repository_tools(config)
     documentation_tools = await get_documentation_tools(config)
-    tools = [*repository_tools, *documentation_tools, rag_ingest, rag_rebuild, rag_status]
+    tools = [
+        *repository_tools,
+        *documentation_tools,
+        rag_ingest,
+        rag_rebuild,
+        rag_status,
+        rag_maintain,
+    ]
     unique: dict[str, Any] = {}
     for value in tools:
         unique.setdefault(_tool_name(value), value)

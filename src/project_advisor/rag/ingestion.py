@@ -66,6 +66,7 @@ class IngestionPipeline:
         self,
         store,
         project_name: str,
+        policy=None,
     ) -> dict:
         """从 DocumentStore 读取文档并索引。
 
@@ -76,7 +77,9 @@ class IngestionPipeline:
         Returns:
             索引统计信息
         """
-        evidences = store.get_by_project(project_name)
+        # Index only the newest valid, unexpired version for each source URL.
+        # Historical versions remain in DocumentStore for auditability.
+        evidences = store.get_current_by_project(project_name, policy=policy)
         return self.ingest_evidence(project_name, evidences)
 
     def search(

@@ -8,12 +8,16 @@
 """
 
 import asyncio
-from typing import Optional
+import logging
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from project_advisor.observability.logging import log_event
 from project_advisor.usage_tracking import record_message_usage
+from project_advisor.utils import invoke_structured_with_retry
+
+logger = logging.getLogger(__name__)
 
 
 class RelevanceScore(BaseModel):
@@ -33,6 +37,9 @@ class Reranker:
         self,
         model_name: str = "deepseek:deepseek-chat",
         use_llm: bool = True,
+        timeout_seconds: float = 60.0,
+        max_attempts: int = 2,
+        max_concurrency: int = 5,
     ):
         """初始化重排序器。
 
@@ -42,20 +49,22 @@ class Reranker:
         """
         self.model_name = model_name
         self.use_llm = use_llm
+        self.timeout_seconds = timeout_seconds
+        self.max_attempts = max(1, max_attempts)
+        self.max_concurrency = max(1, max_concurrency)
         self._model = None
 
     def _get_model(self):
         """延迟加载模型。"""
         if self._model is None and self.use_llm:
             from project_advisor.utils import create_chat_model
-            self._model = (
-                create_chat_model(self.model_name)
-                .with_structured_output(
-                    RelevanceScore,
-                    method="function_calling",
-                    include_raw=True,
-                )
-                .with_retry(stop_after_attempt=2)
+            self._model = create_chat_model(
+                self.model_name,
+                timeout_seconds=self.timeout_seconds,
+            ).with_structured_output(
+                RelevanceScore,
+                method="function_calling",
+                include_raw=True,
             )
         return self._model
 
@@ -97,17 +106,25 @@ class Reranker:
             if model is None:
                 return index, 5  # 无模型时默认中等分数
 
-            for _ in range(2):
-                envelope = await model.ainvoke([
+            response, _ = await invoke_structured_with_retry(
+                model,
+                [
                     SystemMessage(content="你是技术文档相关性评估专家。客观评分，综合考虑相关性、权威性、新鲜度和技术深度。"),
                     HumanMessage(content=prompt),
-                ])
-                record_message_usage(envelope.get("raw"))
-                response = envelope.get("parsed")
-                if response is not None:
-                    return index, float(response.score)
-            return index, 5
-        except Exception:
+                ],
+                max_attempts=self.max_attempts,
+                on_raw=record_message_usage,
+            )
+            return index, float(response.score)
+        except Exception as error:
+            log_event(
+                logger,
+                logging.WARNING,
+                "reranker_score_fallback",
+                document_index=index,
+                source_url=metadata.get("source_url", ""),
+                error_type=type(error).__name__,
+            )
             return index, 5  # 出错时保持原分数
 
     async def rerank(
@@ -134,9 +151,14 @@ class Reranker:
             return documents
 
         if self.use_llm:
-            # 并行评分
+            semaphore = asyncio.Semaphore(self.max_concurrency)
+
+            async def score_bounded(index: int, document: dict) -> tuple[int, float]:
+                async with semaphore:
+                    return await self._score_single(query, document, index)
+
             tasks = [
-                self._score_single(query, doc, i)
+                score_bounded(i, doc)
                 for i, doc in enumerate(documents[:20])  # 最多重排 20 个
             ]
             scores = await asyncio.gather(*tasks)
@@ -149,17 +171,4 @@ class Reranker:
             documents.sort(
                 key=lambda x: x.get("rerank_score", 5), reverse=True
             )
-        else:
-            # 无 LLM 则维持 RRF 融合分数排序
-            pass
-
         return documents[:top_k]
-
-    def rerank_sync(
-        self,
-        query: str,
-        documents: list[dict],
-        top_k: int = 5,
-    ) -> list[dict]:
-        """同步版本的 rerank（供工具调用使用）。"""
-        return asyncio.run(self.rerank(query, documents, top_k))

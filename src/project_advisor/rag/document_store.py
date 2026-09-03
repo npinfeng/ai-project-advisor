@@ -12,11 +12,18 @@ import json
 import hashlib
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from project_advisor.schemas.evidence import Evidence
+from project_advisor.rag.evidence_lifecycle import (
+    EvidenceLifecyclePolicy,
+    classify_evidence,
+    is_valid_evidence_url,
+    lifecycle_snapshot,
+    resolve_current_evidences,
+)
 
 
 class DocumentStore:
@@ -102,6 +109,8 @@ class DocumentStore:
         Returns:
             如果新增返回 True，如果已存在返回 False
         """
+        if not is_valid_evidence_url(evidence.source_url):
+            raise ValueError(f"无效 Evidence URL：{evidence.source_url!r}")
         if evidence.evidence_id in self._evidence_index:
             return False
 
@@ -126,6 +135,8 @@ class DocumentStore:
         count = 0
         changed_projects: set[str] = set()
         for ev in evidences:
+            if not is_valid_evidence_url(ev.source_url):
+                continue
             if ev.evidence_id in self._evidence_index:
                 continue
             doc_dict = ev.model_dump()
@@ -162,6 +173,95 @@ class DocumentStore:
         docs = docs[:max_results]
 
         return [Evidence.model_validate(d) for d in docs]
+
+    def get_current_by_project(
+        self,
+        project_name: str,
+        *,
+        policy: EvidenceLifecyclePolicy | None = None,
+        max_results: int = 50,
+    ) -> list[Evidence]:
+        """Return indexable records: valid, unexpired, and newest per source URL."""
+        policy = policy or EvidenceLifecyclePolicy()
+        evidences = self.get_by_project(project_name, max_results=100_000)
+        eligible = [
+            evidence
+            for evidence in evidences
+            if classify_evidence(evidence, policy)[0] in {"active", "stale"}
+        ]
+        current, _ = resolve_current_evidences(eligible)
+        return current[:max_results]
+
+    def lifecycle_status(
+        self,
+        project_name: str = "",
+        *,
+        policy: EvidenceLifecyclePolicy | None = None,
+        now: datetime | None = None,
+    ) -> dict:
+        """Inspect retention state without changing stored records."""
+        projects = [project_name] if project_name else list(self._index)
+        evidences = [
+            Evidence.model_validate(doc)
+            for project in projects
+            for doc in self._index.get(project, [])
+        ]
+        snapshot = lifecycle_snapshot(evidences, policy, now=now)
+        snapshot["projects"] = projects
+        return snapshot
+
+    def maintain(
+        self,
+        project_name: str = "",
+        *,
+        policy: EvidenceLifecyclePolicy | None = None,
+        dry_run: bool = True,
+        now: datetime | None = None,
+    ) -> dict:
+        """Remove invalid/expired records; callers rebuild affected indexes after apply."""
+        policy = policy or EvidenceLifecyclePolicy()
+        now = now or datetime.now(timezone.utc)
+        projects = [project_name] if project_name else list(self._index)
+        removed_ids: list[str] = []
+        affected_projects: list[str] = []
+        before = self.lifecycle_status(project_name, policy=policy, now=now)
+
+        for project in projects:
+            docs = self._index.get(project, [])
+            retained: list[dict] = []
+            project_removed: list[str] = []
+            for doc in docs:
+                evidence = Evidence.model_validate(doc)
+                status, _ = classify_evidence(evidence, policy, now=now)
+                if status in {"expired", "invalid"}:
+                    project_removed.append(evidence.evidence_id)
+                else:
+                    retained.append(doc)
+            if not project_removed:
+                continue
+            affected_projects.append(project)
+            removed_ids.extend(project_removed)
+            if dry_run:
+                continue
+            for evidence_id in project_removed:
+                self._evidence_index.discard(evidence_id)
+            if retained:
+                self._index[project] = retained
+                self._save_project(project)
+            else:
+                self.clear_project(project)
+
+        return {
+            "dry_run": dry_run,
+            "policy": {
+                "stale_after_days": policy.stale_after_days,
+                "expire_after_days": policy.expire_after_days,
+            },
+            "before": before,
+            "removed_count": len(removed_ids),
+            "removed_evidence_ids": removed_ids,
+            "affected_projects": affected_projects,
+        }
 
     def search(
         self,

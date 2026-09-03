@@ -34,6 +34,8 @@ def test_research_subgraphs_have_execution_loops():
 
     assert "research_supervisor" not in workflow_mermaid
     assert "parallel_research" in workflow_mermaid
+    assert "await_clarification" in workflow_mermaid
+    assert "confirm_plan" in workflow_mermaid
     assert "evidence_coverage" in workflow_mermaid
     assert "supplemental_research" in workflow_mermaid
     assert "repository_analyst -.-> analyst_tools" in repository_mermaid
@@ -87,15 +89,13 @@ def test_manual_execution_plan_does_not_create_a_planner_model(monkeypatch):
         "confirmed_candidates": ["LangGraph", "CrewAI"],
     }, {}))
 
-    assert output["next"] == "parallel_research"
-    assert len(output["research_tasks"]) == 4
+    assert output["next"] == "confirm_plan"
+    assert len(output["research_tasks"]) == 2
     assert all(
         "比较 LangGraph 与 CrewAI" in task.research_topic
         for task in output["research_tasks"]
     )
-    assert {task.track for task in output["research_tasks"]} == {
-        "repository", "documentation"
-    }
+    assert {task.track for task in output["research_tasks"]} == {"documentation"}
 
 
 def test_review_result_is_structured():
@@ -249,6 +249,12 @@ class FakeGraph:
             "parallel_research": {
                 "notes": ["Evidence"],
                 "next": "evidence_coverage",
+                "tool_executions": [{
+                    "tool_name": "web_fetch_tool",
+                    "status": "succeeded",
+                    "latency_ms": 12,
+                    "retry_count": 1,
+                }],
                 "evidences": [
                     Evidence(
                         source_url="https://docs.example.com/langgraph",
@@ -285,11 +291,20 @@ class FakeGraph:
 def test_web_app_and_sse_stream(monkeypatch):
     app_module = importlib.import_module("project_advisor.app")
     monkeypatch.setattr(app_module, "graph", FakeGraph())
+    confirmed_plan = ResearchPlan(
+        research_brief="评估 Python 多智能体框架。",
+        requirements=Requirements(language="Python"),
+        candidates=[CandidateRecommendation(name="LangGraph", reason="用户确认")],
+        evaluation_focus=["feature_match"],
+    )
     client = TestClient(app_module.app)
 
     health_response = client.get("/api/health")
     assert health_response.status_code == 200
-    assert health_response.json()["status"] == "ok"
+    assert health_response.json()["status"] in {"ok", "degraded"}
+    assert health_response.json()["model_runtime"]["status"] in {
+        "ready", "unavailable"
+    }
 
     page_response = client.get("/")
     assert page_response.status_code == 200
@@ -314,6 +329,8 @@ def test_web_app_and_sse_stream(monkeypatch):
         json={
             "question": "请评估适合 Python 多智能体应用的框架。",
             "candidates": ["LangGraph"],
+            "confirmed_candidates": True,
+            "confirmed_plan": confirmed_plan.model_dump(),
         },
     ) as response:
         body = "".join(response.iter_text())
@@ -329,8 +346,106 @@ def test_web_app_and_sse_stream(monkeypatch):
     assert '"stage_durations_ms"' in body
     assert '"token_usage"' in body
     assert '"total_tokens": 125' in body
+    assert '"tool_execution": {"total": 1, "succeeded": 1' in body
+    assert '"retries": 1' in body
     assert '"retrieved_evidences"' in body
     assert '"evidence_id"' in body
+
+
+def test_agent_run_timeout_returns_explicit_sse_error(monkeypatch):
+    app_module = importlib.import_module("project_advisor.app")
+
+    class SlowGraph:
+        async def astream(self, *args, **kwargs):
+            await asyncio.sleep(0.1)
+            yield {"generate_report": {"final_report": "should not finish"}}
+
+    plan = ResearchPlan(
+        research_brief="测试运行超时。",
+        requirements=Requirements(language="Python"),
+        candidates=[CandidateRecommendation(name="LangGraph", reason="测试")],
+        evaluation_focus=["feature_match"],
+    )
+    monkeypatch.setattr(app_module, "graph", SlowGraph())
+    monkeypatch.setenv("AGENT_RUN_TIMEOUT_SECONDS", "0.01")
+
+    with TestClient(app_module.app).stream(
+        "POST",
+        "/api/advice/stream",
+        json={
+            "question": "请测试一个会超过执行时间上限的评估任务。",
+            "confirmed_plan": plan.model_dump(),
+            "confirmed_candidates": True,
+            "candidates": ["LangGraph"],
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "event: error" in body
+    assert "端到端超时" in body
+    assert "should not finish" not in body
+
+
+def test_health_reports_degraded_when_model_runtime_is_unavailable(monkeypatch):
+    app_module = importlib.import_module("project_advisor.app")
+    utils_module = importlib.import_module("project_advisor.utils")
+
+    def unavailable_model(*args, **kwargs):
+        raise ValueError("model API key is missing")
+
+    monkeypatch.setattr(utils_module, "create_chat_model", unavailable_model)
+    response = TestClient(app_module.app).get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert response.json()["model_runtime"]["status"] == "unavailable"
+
+
+def test_stream_prepares_structured_plan_for_manual_candidates(monkeypatch):
+    app_module = importlib.import_module("project_advisor.app")
+    plan = ResearchPlan(
+        research_brief="评估适合私有化部署的 Python Agent 框架。",
+        requirements=Requirements(
+            language="Python",
+            deployment="self_hosted",
+            required_features=["human_in_the_loop"],
+        ),
+        candidates=[CandidateRecommendation(name="AutoCandidate", reason="自动推荐")],
+        evaluation_focus=["feature_match", "deployment_cost"],
+    )
+    captured = {}
+
+    async def fake_generate_candidate_plan(question):
+        assert "LangGraph" in question
+        return plan, {"input_tokens": 20, "output_tokens": 10}
+
+    class CapturingGraph(FakeGraph):
+        async def astream(self, graph_input, *args, **kwargs):
+            captured["graph_input"] = graph_input
+            async for update in super().astream(graph_input, *args, **kwargs):
+                yield update
+
+    monkeypatch.setattr(app_module, "_generate_candidate_plan", fake_generate_candidate_plan)
+    monkeypatch.setattr(app_module, "graph", CapturingGraph())
+
+    with TestClient(app_module.app).stream(
+        "POST",
+        "/api/advice/stream",
+        json={
+            "question": "请比较适合 Python 私有化部署的框架。",
+            "candidates": ["LangGraph", "CrewAI"],
+            "confirmed_candidates": True,
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    confirmed_plan = captured["graph_input"]["confirmed_plan"]
+    assert confirmed_plan["requirements"]["language"] == "Python"
+    assert confirmed_plan["requirements"]["deployment"] == "self_hosted"
+    assert captured["graph_input"]["confirmed_candidates"] == ["LangGraph", "CrewAI"]
+    assert '"total_tokens": 155' in body
 
 
 def test_pending_evaluation_is_visible_without_fake_metrics(
@@ -410,6 +525,7 @@ def test_candidate_suggestion_preview(monkeypatch):
     assert len(payload["candidates"]) == 2
     assert payload["candidates"][0]["reason"]
     assert "planning_diagnostics" in payload
+    assert len(payload["planning_diagnostics"]["request_id"]) == 32
 
 
 def test_api_key_rate_limit_and_capacity_protection(monkeypatch):

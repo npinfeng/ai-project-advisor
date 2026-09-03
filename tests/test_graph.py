@@ -129,11 +129,14 @@ def test_citation_tools():
 
 def test_github_url_parsing():
     """验证 GitHub URL 解析。"""
-    from project_advisor.tools.github import _extract_owner_repo
+    from project_advisor import __version__
+    from project_advisor.tools.github import _extract_owner_repo, _get_headers
 
     assert _extract_owner_repo("https://github.com/langchain-ai/langgraph") == ("langchain-ai", "langgraph")
     assert _extract_owner_repo("https://github.com/crewAIInc/crewAI.git") == ("crewAIInc", "crewAI")
     assert _extract_owner_repo("langchain-ai/langgraph") == ("langchain-ai", "langgraph")
+    assert __version__ == "0.2.0"
+    assert _get_headers()["User-Agent"] == f"project-advisor/{__version__}"
     print("✅ GitHub URL parsing works correctly")
 
 
@@ -293,6 +296,7 @@ def test_tools_registered():
         assert "github_get_repo" not in documentation_names
         assert "rag_ingest" not in documentation_names
         assert "rag_rebuild" not in documentation_names
+        assert "rag_maintain" not in documentation_names
 
     asyncio.run(run())
 
@@ -380,6 +384,54 @@ def test_rag_modules():
         print("RAG modules work correctly")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_openai_compatible_model_does_not_import_openai_or_jiter(monkeypatch):
+    """DeepSeek/OpenAI chat should work without blocked native SDK extensions."""
+    import sys
+
+    from project_advisor.openai_compatible_chat import OpenAICompatibleChatModel
+    from project_advisor.schemas.evidence import ProjectScore
+    from project_advisor.utils import create_chat_model
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    sys.modules.pop("openai", None)
+    sys.modules.pop("jiter", None)
+
+    model = create_chat_model("deepseek:deepseek-chat", max_tokens=128)
+    assert isinstance(model, OpenAICompatibleChatModel)
+    assert "openai" not in sys.modules
+    assert "jiter" not in sys.modules
+    assert model._endpoint() == "https://api.deepseek.com/chat/completions"
+
+    structured = model.with_structured_output(
+        ProjectScore,
+        method="function_calling",
+        include_raw=True,
+    )
+    assert structured is not None
+
+    parsed = OpenAICompatibleChatModel._result({
+        "model": "deepseek-chat",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "ProjectScore",
+                        "arguments": '{"project_name":"LangGraph","feature_match":9}',
+                    },
+                }],
+            },
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    })
+    message = parsed.generations[0].message
+    assert message.tool_calls[0]["args"]["project_name"] == "LangGraph"
+    assert message.usage_metadata["total_tokens"] == 15
 
 
 if __name__ == "__main__":

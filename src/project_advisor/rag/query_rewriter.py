@@ -1,4 +1,4 @@
-"""查询改写器 — 优化用户查询以提升检索质量。
+"""Async query rewriting with bounded structured-output fallback.
 
 策略：
 1. Query Rewrite：将用户问题改写为更适合检索的查询
@@ -6,10 +6,16 @@
 3. Context Compression：从检索结果中只保留与查询相关的段落
 """
 
+import logging
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from project_advisor.observability.logging import log_event
 from project_advisor.usage_tracking import record_message_usage
+from project_advisor.utils import invoke_structured_with_retry
+
+logger = logging.getLogger(__name__)
 
 
 class RewrittenQuery(BaseModel):
@@ -31,41 +37,47 @@ class QueryRewriter:
     支持生成多角度子查询以覆盖不同评估维度。
     """
 
-    def __init__(self, model_name: str = "deepseek:deepseek-chat"):
+    def __init__(
+        self,
+        model_name: str = "deepseek:deepseek-chat",
+        *,
+        timeout_seconds: float = 60.0,
+        max_attempts: int = 2,
+    ):
         """初始化查询改写器。
 
         Args:
             model_name: 用于查询改写的模型
         """
         self.model_name = model_name
+        self.timeout_seconds = timeout_seconds
+        self.max_attempts = max(1, max_attempts)
         self._rewrite_model = None
         self._multi_query_model = None
 
     def _get_rewrite_model(self):
         if self._rewrite_model is None:
             from project_advisor.utils import create_chat_model
-            self._rewrite_model = (
-                create_chat_model(self.model_name)
-                .with_structured_output(
-                    RewrittenQuery,
-                    method="function_calling",
-                    include_raw=True,
-                )
-                .with_retry(stop_after_attempt=2)
+            self._rewrite_model = create_chat_model(
+                self.model_name,
+                timeout_seconds=self.timeout_seconds,
+            ).with_structured_output(
+                RewrittenQuery,
+                method="function_calling",
+                include_raw=True,
             )
         return self._rewrite_model
 
     def _get_multi_query_model(self):
         if self._multi_query_model is None:
             from project_advisor.utils import create_chat_model
-            self._multi_query_model = (
-                create_chat_model(self.model_name)
-                .with_structured_output(
-                    MultiQueries,
-                    method="function_calling",
-                    include_raw=True,
-                )
-                .with_retry(stop_after_attempt=2)
+            self._multi_query_model = create_chat_model(
+                self.model_name,
+                timeout_seconds=self.timeout_seconds,
+            ).with_structured_output(
+                MultiQueries,
+                method="function_calling",
+                include_raw=True,
             )
         return self._multi_query_model
 
@@ -97,23 +109,29 @@ class QueryRewriter:
 只返回改写后的查询，不要解释。"""
 
         try:
-            for _ in range(2):
-                envelope = await model.ainvoke([
+            response, _ = await invoke_structured_with_retry(
+                model,
+                [
                     SystemMessage(content="你是信息检索专家。将用户问题改写为高效的搜索查询。"),
                     HumanMessage(content=prompt),
-                ])
-                record_message_usage(envelope.get("raw"))
-                response = envelope.get("parsed")
-                if response is not None:
-                    return response.rewritten
-            return query
-        except Exception:
+                ],
+                max_attempts=self.max_attempts,
+                on_raw=record_message_usage,
+            )
+            return response.rewritten
+        except Exception as error:
+            log_event(
+                logger,
+                logging.WARNING,
+                "query_rewrite_fallback",
+                error_type=type(error).__name__,
+            )
             return query
 
     async def generate_multi_queries(
         self,
         query: str,
-        candidates: list[str] = None,
+        candidates: list[str] | None = None,
     ) -> list[str]:
         """生成多角度子查询，覆盖不同评估维度。
 
@@ -145,32 +163,23 @@ class QueryRewriter:
 只返回查询列表。"""
 
         try:
-            response = None
-            for _ in range(2):
-                envelope = await model.ainvoke([
+            response, _ = await invoke_structured_with_retry(
+                model,
+                [
                     SystemMessage(content="你是技术搜索专家。从多角度生成精确的搜索查询以覆盖技术选型的所有维度。"),
                     HumanMessage(content=prompt),
-                ])
-                record_message_usage(envelope.get("raw"))
-                response = envelope.get("parsed")
-                if response is not None:
-                    break
-            if response is None:
-                return [query]
+                ],
+                max_attempts=self.max_attempts,
+                on_raw=record_message_usage,
+            )
             # 原始查询也保留
             all_queries = [query] + response.queries
             return all_queries[:6]  # 最多 6 个查询
-        except Exception:
+        except Exception as error:
+            log_event(
+                logger,
+                logging.WARNING,
+                "multi_query_fallback",
+                error_type=type(error).__name__,
+            )
             return [query]
-
-    def rewrite_sync(self, query: str) -> str:
-        """同步版本的 rewrite。"""
-        import asyncio
-        return asyncio.run(self.rewrite(query))
-
-    def multi_query_sync(
-        self, query: str, candidates: list[str] = None
-    ) -> list[str]:
-        """同步版本的多查询生成。"""
-        import asyncio
-        return asyncio.run(self.generate_multi_queries(query, candidates))

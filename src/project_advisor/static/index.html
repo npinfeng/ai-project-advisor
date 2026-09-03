@@ -74,6 +74,10 @@
         </fieldset>
 
         <p class="candidate-help" id="autoCandidateHelp">第一次提交只生成候选清单；确认、删除或补充后，才会开始深度评估。</p>
+        <label class="clarification-option" id="clarificationOption">
+          <input id="allowClarification" type="checkbox">
+          <span><strong>启用深度澄清</strong><small>系统可连续追问关键约束，并在 checkpoint 中等待你继续</small></span>
+        </label>
         <div id="manualCandidateField" hidden>
           <label for="candidates">候选项目 <span>用逗号分隔，最多 8 个</span></label>
           <input id="candidates" name="candidates" placeholder="例如：LangGraph, CrewAI">
@@ -127,48 +131,78 @@
             <div><strong>需求解析</strong><small>提取约束与目标</small></div>
             <span class="timeline-state">等待</span>
           </li>
-          <li data-node="plan_evaluation">
+          <li data-node="await_clarification">
             <span class="timeline-icon">02</span>
+            <div><strong>等待需求补充</strong><small>保存 checkpoint 后等待回答</small></div>
+            <span class="timeline-state">等待</span>
+          </li>
+          <li data-node="plan_evaluation">
+            <span class="timeline-icon">03</span>
             <div><strong>生成评估计划</strong><small>确定候选项与研究维度</small></div>
             <span class="timeline-state">等待</span>
           </li>
+          <li data-node="confirm_plan">
+            <span class="timeline-icon">04</span>
+            <div><strong>确认候选项目</strong><small>允许删除或补充候选项</small></div>
+            <span class="timeline-state">等待</span>
+          </li>
           <li data-node="feasibility_check">
-            <span class="timeline-icon">03</span>
+            <span class="timeline-icon">05</span>
             <div><strong>约束可行性预检</strong><small>识别硬约束冲突和降级路径</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="parallel_research">
-            <span class="timeline-icon">04</span>
+            <span class="timeline-icon">06</span>
             <div><strong>专业化并行研究</strong><small>隔离的仓库与文档工具集</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="evidence_coverage">
-            <span class="timeline-icon">05</span>
+            <span class="timeline-icon">07</span>
             <div><strong>确定性证据检查</strong><small>按候选项目和来源轨道检查缺口</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="supplemental_research">
-            <span class="timeline-icon">06</span>
+            <span class="timeline-icon">08</span>
             <div><strong>受限补充研究</strong><small>仅缺口存在时执行一次</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="review_and_score">
-            <span class="timeline-icon">07</span>
+            <span class="timeline-icon">09</span>
             <div><strong>证据审查与评分</strong><small>七维加权评分与冲突检查</small></div>
             <span class="timeline-state">等待</span>
           </li>
           <li data-node="generate_report">
-            <span class="timeline-icon">08</span>
+            <span class="timeline-icon">10</span>
             <div><strong>确定性报告生成</strong><small>模板渲染结论、风险与引用</small></div>
             <span class="timeline-state">等待</span>
           </li>
         </ol>
+
+        <section class="interaction-card" id="interactionPanel" hidden>
+          <span class="eyebrow">CHECKPOINT PAUSED</span>
+          <h3 id="interactionTitle">任务正在等待输入</h3>
+          <p id="interactionQuestion"></p>
+          <textarea id="interactionAnswer" rows="4" placeholder="输入回答后继续"></textarea>
+          <button class="primary-button" id="continueButton" type="button">继续任务</button>
+        </section>
 
         <div class="idle-card" id="idleCard">
           <span class="radar"><i></i><i></i><i></i></span>
           <p>提交任务后，这里会实时展示每个 Agent 的执行状态。</p>
         </div>
       </section>
+    </section>
+
+    <section class="evaluation-panel task-history-panel" aria-labelledby="taskHistoryTitle">
+      <div class="evaluation-heading">
+        <div>
+          <span class="eyebrow">PERSISTENT TASKS</span>
+          <h2 id="taskHistoryTitle">最近任务</h2>
+          <p>任务、待输入状态和报告保存在本机 SQLite 中。</p>
+        </div>
+        <button class="secondary-button" id="refreshTasksButton" type="button">刷新</button>
+      </div>
+      <div class="task-history-list" id="taskHistoryList"><p>正在加载任务…</p></div>
     </section>
 
     <section class="evaluation-panel" id="evaluationPanel" aria-labelledby="evaluationTitle">
@@ -220,7 +254,9 @@
           <div><span>候选项目</span><strong id="runtimeCandidates">—</strong></div>
           <div><span>引用 URL</span><strong id="runtimeCitations">—</strong></div>
           <div><span>MCP 状态 / 工具</span><strong id="runtimeMcp">—</strong></div>
+          <div><span>Tool 成功 / 总数</span><strong id="runtimeTools">—</strong></div>
           <div><span>Token 用量</span><strong id="runtimeTokens">—</strong></div>
+          <div><span>Reviewer 证据字符</span><strong id="runtimeContext">—</strong></div>
           <div><span>成本估算</span><strong id="runtimeCost">—</strong></div>
         </div>
         <div class="stage-duration-list" id="stageDurations"></div>

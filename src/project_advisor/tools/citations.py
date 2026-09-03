@@ -4,6 +4,10 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from project_advisor.schemas.evidence import Evidence
+from project_advisor.rag.evidence_lifecycle import (
+    is_valid_evidence_url,
+    resolve_current_evidences,
+)
 
 # 来源类型权威性权重（供置信度计算和 Reviewer 参考）
 SOURCE_AUTHORITY_WEIGHTS: dict[str, float] = {
@@ -197,6 +201,8 @@ def validate_citation(
 
     if not evidence.source_url:
         issues.append("缺少来源 URL")
+    elif not is_valid_evidence_url(evidence.source_url):
+        issues.append("来源 URL 格式无效")
     if not evidence.content:
         issues.append("证据内容为空")
     if not evidence.retrieved_at:
@@ -225,7 +231,7 @@ def detect_conflicts(
     Returns:
         冲突列表
     """
-    conflicts = []
+    _, conflicts = resolve_current_evidences(evidences)
     # 按 (project_name, relevance) 分组
     groups: dict[tuple[str, str], list[Evidence]] = {}
     for e in evidences:

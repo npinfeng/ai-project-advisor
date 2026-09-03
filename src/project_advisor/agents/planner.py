@@ -22,6 +22,7 @@ from project_advisor.utils import (
     create_chat_model,
     get_message_token_usage,
     get_today_str,
+    invoke_structured_with_retry,
 )
 from project_advisor.usage_tracking import add_usage
 
@@ -98,6 +99,7 @@ async def clarify_requirements(state: AgentState, config: RunnableConfig):
         create_chat_model(
             configurable.research_model,
             max_tokens=configurable.research_model_max_tokens,
+            timeout_seconds=configurable.llm_timeout_seconds,
         )
         .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
     )
@@ -131,9 +133,10 @@ async def clarify_requirements(state: AgentState, config: RunnableConfig):
     if need_clarification and clarification_round < max_rounds:
         return {
             "messages": [AIMessage(content=question)],
+            "pending_clarification": question,
             "clarification_round": clarification_round + 1,
             "token_usage": token_usage,
-            "next": "__end__",
+            "next": "await_clarification",
         }
 
     # 不需要追问或已达最大轮数，确认并继续
@@ -165,27 +168,26 @@ async def generate_research_plan_with_usage(
         create_chat_model(
             configurable.research_model,
             max_tokens=configurable.research_model_max_tokens,
+            timeout_seconds=configurable.llm_timeout_seconds,
         )
         .with_structured_output(
             ResearchPlan,
             method="function_calling",
             include_raw=True,
         )
-        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
     )
 
     prompt = transform_messages_into_research_topic_prompt.format(
         messages=get_buffer_string(messages),
         date=get_today_str(),
     )
-    usage_values = []
-    for _ in range(configurable.max_structured_output_retries):
-        envelope = await research_model.ainvoke([HumanMessage(content=prompt)])
-        usage_values.append(get_message_token_usage(envelope.get("raw")))
-        plan = envelope.get("parsed")
-        if plan is not None:
-            return plan, add_usage(*usage_values)
-    raise ValueError("Planner 未返回有效的结构化研究计划。")
+    plan, raw_responses = await invoke_structured_with_retry(
+        research_model,
+        [HumanMessage(content=prompt)],
+        max_attempts=configurable.max_structured_output_retries,
+    )
+    usage_values = [get_message_token_usage(raw) for raw in raw_responses]
+    return plan, add_usage(*usage_values)
 
 
 def _apply_confirmed_candidates(
@@ -246,10 +248,10 @@ def build_research_tasks(
             if requested_tracks is not None
             else {"repository", "documentation"}
         )
-        # 没有 GitHub URL 的项目仍然创建仓库任务，
-        # 研究员可以在没有 GitHub URL 的情况下使用备用搜索策略
-        if "repository" in allowed_tracks:
-            github_reference = candidate.github_url or "未提供；不得猜测仓库地址"
+        # Repository Agent 只有 GitHub 工具。缺少 URL 时由文档轨道负责发现，
+        # 避免创建一个确定会失败并消耗一次 LLM 循环的伪任务。
+        if "repository" in allowed_tracks and candidate.github_url:
+            github_reference = candidate.github_url
             tasks.append(ResearchTask(
                 task_id=f"r{round_number}-repository-{index}",
                 project_name=candidate.name,
@@ -284,6 +286,7 @@ def build_research_tasks(
 
 async def plan_evaluation(state: AgentState, config: RunnableConfig):
     """Generate or reuse a confirmed structured research plan."""
+    plan_usage = {"input_tokens": 0, "output_tokens": 0}
     confirmed_plan = state.get("confirmed_plan")
     if confirmed_plan:
         response = (
@@ -294,28 +297,31 @@ async def plan_evaluation(state: AgentState, config: RunnableConfig):
     else:
         confirmed_candidates = state.get("confirmed_candidates", [])
         if not confirmed_candidates:
-            raise ValueError("执行研究前必须确认候选项目。")
-        brief = get_buffer_string(state.get("messages", []))
-        response = ResearchPlan(
-            research_brief=brief,
-            requirements=Requirements(additional_notes=brief[:2000]),
-            candidates=[
-                CandidateRecommendation(
-                    name=name,
-                    reason="用户在执行前明确确认。",
-                )
-                for name in confirmed_candidates
-            ],
-            evaluation_focus=[
-                "feature_match",
-                "engineering_reliability",
-                "community_and_maintenance",
-                "documentation_quality",
-                "learning_cost",
-                "extensibility",
-                "deployment_cost",
-            ],
-        )
+            response, plan_usage = await generate_research_plan_with_usage(
+                state.get("messages", []), config
+            )
+        else:
+            brief = get_buffer_string(state.get("messages", []))
+            response = ResearchPlan(
+                research_brief=brief,
+                requirements=Requirements(additional_notes=brief[:2000]),
+                candidates=[
+                    CandidateRecommendation(
+                        name=name,
+                        reason="用户在执行前明确确认。",
+                    )
+                    for name in confirmed_candidates
+                ],
+                evaluation_focus=[
+                    "feature_match",
+                    "engineering_reliability",
+                    "community_and_maintenance",
+                    "documentation_quality",
+                    "learning_cost",
+                    "extensibility",
+                    "deployment_cost",
+                ],
+            )
 
     response = _apply_confirmed_candidates(
         response,
@@ -339,5 +345,6 @@ async def plan_evaluation(state: AgentState, config: RunnableConfig):
         "research_round": 0,
         "supplemental_round_used": False,
         "evidence_gaps": [],
-        "next": "parallel_research",
+        "token_usage": plan_usage,
+        "next": "confirm_plan",
     }

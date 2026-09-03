@@ -50,14 +50,24 @@ class Embedder:
     def _get_openai_embedding(self, texts: list[str]) -> list[list[float]]:
         """使用 OpenAI API 生成嵌入。"""
         import os
-        from openai import OpenAI
+        import httpx
 
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        response = client.embeddings.create(
-            model=self.model_name,
-            input=texts,
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY 未设置，请检查 .env 文件。")
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        response = httpx.post(
+            f"{base_url.rstrip('/')}/embeddings",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": self.model_name, "input": texts},
+            timeout=60.0,
         )
-        return [d.embedding for d in response.data]
+        response.raise_for_status()
+        data = response.json().get("data") or []
+        return [item["embedding"] for item in data]
 
     def embed(self, text: str) -> list[float]:
         """对单个文本进行嵌入。使用缓存避免重复计算。

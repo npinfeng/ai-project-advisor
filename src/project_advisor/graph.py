@@ -12,6 +12,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 from project_advisor.agents.documentation_researcher import (
     compress_research as doc_summarize,
@@ -30,6 +31,7 @@ from project_advisor.agents.repository_analyst import (
 )
 from project_advisor.agents.reviewer import generate_report, review_and_score
 from project_advisor.configuration import Configuration
+from project_advisor.observability.logging import bind_log_context, log_event
 from project_advisor.rag.knowledge_store import persist_evidences
 from project_advisor.schemas.evidence import CandidateRecommendation, Evidence
 from project_advisor.state import (
@@ -133,15 +135,25 @@ async def _run_research_task(
         "research_topic": task.research_topic,
         "project_name": task.project_name,
     }
-    if task.track == "repository":
-        return await researcher_subgraph_repo.ainvoke(task_input, config)
-    return await researcher_subgraph_doc.ainvoke(task_input, config)
+    with bind_log_context(
+        research_task_id=task.task_id,
+        candidate=task.project_name,
+        track=task.track,
+        node=f"{task.track}_research",
+    ):
+        log_event(logger, logging.INFO, "research_task_started")
+        if task.track == "repository":
+            result = await researcher_subgraph_repo.ainvoke(task_input, config)
+        else:
+            result = await researcher_subgraph_doc.ainvoke(task_input, config)
+        log_event(logger, logging.INFO, "research_task_completed")
+        return result
 
 
 async def _execute_research_tasks(
     tasks: list[ResearchTask],
     config: RunnableConfig,
-) -> tuple[list[Evidence], list[str], dict[str, int]]:
+) -> tuple[list[Evidence], list[str], dict[str, int], list[dict[str, Any]]]:
     configurable = Configuration.from_runnable_config(config)
     concurrency = max(1, configurable.max_concurrent_research_units)
     semaphore = asyncio.Semaphore(concurrency)
@@ -151,13 +163,25 @@ async def _execute_research_tasks(
             try:
                 return task, await _run_research_task(task, config)
             except Exception as error:
-                logger.exception("Research task failed: %s", task.task_id)
+                with bind_log_context(
+                    research_task_id=task.task_id,
+                    candidate=task.project_name,
+                    track=task.track,
+                ):
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "research_task_failed",
+                        error_type=type(error).__name__,
+                    )
+                    logger.exception("Research task failed")
                 return task, error
 
     results = await asyncio.gather(*(run(task) for task in tasks))
     evidences: list[Any] = []
     notes: list[str] = []
     token_usage = {"input_tokens": 0, "output_tokens": 0}
+    tool_executions: list[dict[str, Any]] = []
     for task, result in results:
         if isinstance(result, Exception):
             notes.append(
@@ -167,6 +191,7 @@ async def _execute_research_tasks(
             continue
         evidences.extend(result.get("evidences", []))
         result_usage = result.get("token_usage", {})
+        tool_executions.extend(result.get("tool_executions", []))
         token_usage["input_tokens"] += int(
             result_usage.get("input_tokens", 0) or 0
         )
@@ -182,8 +207,14 @@ async def _execute_research_tasks(
         try:
             await asyncio.to_thread(persist_evidences, normalized)
         except Exception:
+            log_event(
+                logger,
+                logging.ERROR,
+                "evidence_persistence_failed",
+                evidence_count=len(normalized),
+            )
             logger.exception("Failed to persist reusable research evidence")
-    return normalized, notes, token_usage
+    return normalized, notes, token_usage, tool_executions
 
 
 async def parallel_research(
@@ -201,10 +232,13 @@ async def parallel_research(
     # 首轮研究开始时清空缓存，避免跨评估污染
     if state.get("research_round", 0) == 0:
         clear_shared_cache()
-    evidences, notes, token_usage = await _execute_research_tasks(tasks, config)
+    evidences, notes, token_usage, tool_executions = await _execute_research_tasks(
+        tasks, config
+    )
     return {
         "evidences": evidences,
         "raw_notes": notes,
+        "tool_executions": tool_executions,
         "token_usage": token_usage,
         "research_round": max((task.round for task in tasks), default=0),
         "next": "evidence_coverage",
@@ -277,12 +311,97 @@ def evidence_coverage(state: AgentState) -> dict[str, Any]:
 
 
 def _route_after_clarify(state: AgentState) -> str:
-    next_step = state.get("next", "plan_evaluation")
-    return END if next_step == "__end__" else next_step
+    return state.get("next", "plan_evaluation")
 
 
 def _route_after_plan(state: AgentState) -> str:
-    return state.get("next", "parallel_research")
+    return state.get("next", "confirm_plan")
+
+
+def await_clarification(state: AgentState) -> dict[str, Any]:
+    """Pause safely until the user provides the next clarification answer."""
+    question = state.get("pending_clarification", "") or "请补充你的关键约束。"
+    answer: Any = interrupt({
+        "kind": "clarification",
+        "question": question,
+        "round": state.get("clarification_round", 1),
+        "max_rounds": state.get("max_clarification_rounds", 3),
+    })
+    if isinstance(answer, dict):
+        answer = answer.get("answer", "")
+    answer_text = str(answer or "").strip()
+    while not answer_text:
+        answer = interrupt({
+            "kind": "clarification",
+            "question": "回答不能为空，请补充你的关键约束。",
+            "round": state.get("clarification_round", 1),
+            "max_rounds": state.get("max_clarification_rounds", 3),
+        })
+        if isinstance(answer, dict):
+            answer = answer.get("answer", "")
+        answer_text = str(answer or "").strip()
+    return {
+        "messages": [HumanMessage(content=answer_text)],
+        "pending_clarification": "",
+        "next": "clarify_requirements",
+    }
+
+
+def confirm_plan(state: AgentState) -> dict[str, Any]:
+    """Pause for candidate confirmation without repeating Planner side effects."""
+    recommendations = [
+        value
+        if isinstance(value, CandidateRecommendation)
+        else CandidateRecommendation.model_validate(value)
+        for value in state.get("candidate_recommendations", [])
+    ]
+    existing_names = state.get("confirmed_candidates", [])
+    if existing_names:
+        selected_names = existing_names
+    else:
+        requirements = state.get("requirements")
+        response: Any = interrupt({
+            "kind": "candidate_confirmation",
+            "question": "请确认、删除或补充候选项目后继续。",
+            "requirements": (
+                requirements.model_dump()
+                if hasattr(requirements, "model_dump")
+                else requirements or {}
+            ),
+            "candidates": [item.model_dump() for item in recommendations],
+        })
+        if isinstance(response, dict):
+            response = response.get("candidates", [])
+        if isinstance(response, str):
+            response = response.replace("，", ",").split(",")
+        selected_names = list(dict.fromkeys(
+            str(name).strip() for name in (response or []) if str(name).strip()
+        ))
+        if not selected_names:
+            selected_names = [item.name for item in recommendations]
+    if not selected_names:
+        raise ValueError("候选项目不能为空。")
+    if len(selected_names) > 8:
+        raise ValueError("候选项目最多 8 个。")
+
+    recommendation_map = {item.name.casefold(): item for item in recommendations}
+    selected_recommendations = [
+        recommendation_map.get(name.casefold())
+        or CandidateRecommendation(name=name, reason="用户在确认阶段手动添加。")
+        for name in selected_names
+    ]
+    tasks = build_research_tasks(
+        selected_recommendations,
+        state.get("evaluation_focus", []),
+        research_brief=state.get("research_brief", ""),
+    )
+    return {
+        "confirmed_candidates": selected_names,
+        "candidates": selected_names,
+        "candidate_recommendations": selected_recommendations,
+        "research_tasks": tasks,
+        "next": "feasibility_check",
+    }
 
 
 def _route_researcher(state: ResearcherState, tool_node: str) -> str:
@@ -397,7 +516,9 @@ deep_researcher_builder = StateGraph(
     context_schema=Configuration,
 )
 deep_researcher_builder.add_node("clarify_requirements", clarify_requirements)
+deep_researcher_builder.add_node("await_clarification", await_clarification)
 deep_researcher_builder.add_node("plan_evaluation", plan_evaluation)
+deep_researcher_builder.add_node("confirm_plan", confirm_plan)
 deep_researcher_builder.add_node("feasibility_check", feasibility_check)
 deep_researcher_builder.add_node("parallel_research", parallel_research)
 deep_researcher_builder.add_node("evidence_coverage", evidence_coverage)
@@ -409,9 +530,18 @@ deep_researcher_builder.add_edge(START, "clarify_requirements")
 deep_researcher_builder.add_conditional_edges(
     "clarify_requirements",
     _route_after_clarify,
-    {"plan_evaluation": "plan_evaluation", END: END},
+    {
+        "await_clarification": "await_clarification",
+        "plan_evaluation": "plan_evaluation",
+    },
 )
-deep_researcher_builder.add_edge("plan_evaluation", "feasibility_check")
+deep_researcher_builder.add_edge("await_clarification", "clarify_requirements")
+deep_researcher_builder.add_conditional_edges(
+    "plan_evaluation",
+    _route_after_plan,
+    {"confirm_plan": "confirm_plan"},
+)
+deep_researcher_builder.add_edge("confirm_plan", "feasibility_check")
 deep_researcher_builder.add_edge("feasibility_check", "parallel_research")
 deep_researcher_builder.add_edge("parallel_research", "evidence_coverage")
 deep_researcher_builder.add_conditional_edges(
@@ -426,4 +556,9 @@ deep_researcher_builder.add_edge("supplemental_research", "evidence_coverage")
 deep_researcher_builder.add_edge("review_and_score", "generate_report")
 deep_researcher_builder.add_edge("generate_report", END)
 
-graph = deep_researcher_builder.compile()
+def compile_graph(checkpointer: Any | None = None) -> Any:
+    """Compile the main workflow with an optional persistent checkpointer."""
+    return deep_researcher_builder.compile(checkpointer=checkpointer)
+
+
+graph = compile_graph()

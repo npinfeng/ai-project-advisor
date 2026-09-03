@@ -12,6 +12,8 @@ const candidatePreview = document.querySelector("#candidatePreview");
 const candidatePreviewCount = document.querySelector("#candidatePreviewCount");
 const candidateList = document.querySelector("#candidateList");
 const requirementsSummary = document.querySelector("#requirementsSummary");
+const allowClarificationInput = document.querySelector("#allowClarification");
+const clarificationOption = document.querySelector("#clarificationOption");
 const additionalCandidate = document.querySelector("#additionalCandidate");
 const addCandidateButton = document.querySelector("#addCandidateButton");
 const formError = document.querySelector("#formError");
@@ -29,15 +31,26 @@ const runtimeTotal = document.querySelector("#runtimeTotal");
 const runtimeCandidates = document.querySelector("#runtimeCandidates");
 const runtimeCitations = document.querySelector("#runtimeCitations");
 const runtimeMcp = document.querySelector("#runtimeMcp");
+const runtimeTools = document.querySelector("#runtimeTools");
 const runtimeTokens = document.querySelector("#runtimeTokens");
+const runtimeContext = document.querySelector("#runtimeContext");
 const runtimeCost = document.querySelector("#runtimeCost");
 const stageDurations = document.querySelector("#stageDurations");
 const evaluationState = document.querySelector("#evaluationState");
 const evaluationMeta = document.querySelector("#evaluationMeta");
+const interactionPanel = document.querySelector("#interactionPanel");
+const interactionTitle = document.querySelector("#interactionTitle");
+const interactionQuestion = document.querySelector("#interactionQuestion");
+const interactionAnswer = document.querySelector("#interactionAnswer");
+const continueButton = document.querySelector("#continueButton");
+const taskHistoryList = document.querySelector("#taskHistoryList");
+const refreshTasksButton = document.querySelector("#refreshTasksButton");
 
 const stageOrder = [
   "clarify_requirements",
+  "await_clarification",
   "plan_evaluation",
+  "confirm_plan",
   "feasibility_check",
   "parallel_research",
   "evidence_coverage",
@@ -72,6 +85,8 @@ let controller = null;
 let currentReport = "";
 let currentPlan = null;
 let plannedQuestion = "";
+let currentTaskId = localStorage.getItem("projectAdvisorTaskId") || "";
+let pendingInterrupt = null;
 
 function updateCharacterCount() {
   charCount.textContent = `${questionInput.value.length} / 5000`;
@@ -95,8 +110,13 @@ function updateCandidateMode() {
   manualCandidateField.hidden = automatic;
   if (!automatic) candidatePreview.hidden = true;
   if (automatic && currentPlan) candidatePreview.hidden = false;
+  allowClarificationInput.disabled = !automatic;
+  clarificationOption.classList.toggle("disabled", !automatic);
+  if (!automatic) allowClarificationInput.checked = false;
   submitButtonLabel.textContent = automatic
-    ? (currentPlan ? "确认并开始深度评估" : "生成候选项目")
+    ? (allowClarificationInput.checked
+      ? "开始澄清与评估"
+      : (currentPlan ? "确认并开始深度评估" : "生成候选项目"))
     : "开始深度评估";
 }
 
@@ -209,6 +229,8 @@ function renderDiagnostics(diagnostics) {
   const tokenUsage = diagnostics.token_usage || {};
   const budget = diagnostics.budget || {};
   const mcp = diagnostics.mcp || {};
+  const toolExecution = diagnostics.tool_execution || {};
+  const contextBudget = diagnostics.context_budget || {};
   const mcpLabels = {
     connected: "已连接",
     configured: "已配置",
@@ -222,8 +244,14 @@ function renderDiagnostics(diagnostics) {
   runtimeCandidates.textContent = String(diagnostics.candidate_count ?? 0);
   runtimeCitations.textContent = String(diagnostics.citation_url_count ?? 0);
   runtimeMcp.textContent = `${mcpLabels[mcp.status] || mcp.status || "未知"} / ${mcp.tool_count ?? 0}`;
+  runtimeTools.textContent = `${toolExecution.succeeded ?? 0} / ${toolExecution.total ?? 0}`
+    + `${toolExecution.timed_out ? ` · ${toolExecution.timed_out} 超时` : ""}`
+    + `${toolExecution.retries ? ` · ${toolExecution.retries} 重试` : ""}`;
   runtimeTokens.textContent = tokenUsage.collected
     ? `${Number(tokenUsage.total_tokens || 0).toLocaleString("zh-CN")}${budget.token_limit_enabled ? ` / ${Number(budget.max_run_tokens).toLocaleString("zh-CN")}` : ""}`
+    : "未采集";
+  runtimeContext.textContent = contextBudget.max_chars
+    ? `${Number(contextBudget.used_chars || 0).toLocaleString("zh-CN")} / ${Number(contextBudget.max_chars).toLocaleString("zh-CN")}${contextBudget.compressed ? " · 已压缩" : ""}`
     : "未采集";
   runtimeCost.textContent = diagnostics.cost_configured && tokenUsage.collected
     ? `$${Number(diagnostics.estimated_cost_usd || 0).toFixed(6)}${budget.cost_limit_enabled ? ` / $${Number(budget.max_run_cost_usd).toFixed(4)}` : ""}`
@@ -381,8 +409,39 @@ function renderScores(scores) {
   });
 }
 
+function showInteraction(data) {
+  pendingInterrupt = data;
+  interactionPanel.hidden = false;
+  const kind = data.kind || "resume";
+  if (kind === "candidate_confirmation") {
+    interactionTitle.textContent = "确认候选项目";
+    interactionQuestion.textContent = data.question || "请确认候选项目后继续。";
+    interactionAnswer.placeholder = "用逗号分隔候选项目";
+    interactionAnswer.value = (data.candidates || []).map((item) => item.name || item).join(", ");
+  } else if (kind === "clarification") {
+    interactionTitle.textContent = `补充需求（第 ${data.round || 1} 轮）`;
+    interactionQuestion.textContent = data.question || "请补充关键约束。";
+    interactionAnswer.placeholder = "输入你的回答";
+    interactionAnswer.value = "";
+  } else {
+    interactionTitle.textContent = "恢复已暂停任务";
+    interactionQuestion.textContent = data.question || "任务 checkpoint 已保存，可以从上一个完成节点继续。";
+    interactionAnswer.placeholder = "无需填写，直接继续";
+    interactionAnswer.value = "";
+  }
+  runState.textContent = kind === "resume" ? "PAUSED" : "WAITING";
+}
+
+function hideInteraction() {
+  pendingInterrupt = null;
+  interactionPanel.hidden = true;
+  interactionAnswer.value = "";
+}
+
 function handleEvent(eventName, data) {
   if (eventName === "started") {
+    currentTaskId = data.task_id || currentTaskId;
+    if (currentTaskId) localStorage.setItem("projectAdvisorTaskId", currentTaskId);
     const first = document.querySelector(`[data-node="${stageOrder[0]}"]`);
     first.classList.add("active");
     first.querySelector(".timeline-state").textContent = "执行中";
@@ -392,6 +451,7 @@ function handleEvent(eventName, data) {
     if (data.scores?.length) renderScores(data.scores);
   }
   if (eventName === "result") {
+    hideInteraction();
     currentReport = data.report || "";
     renderScores(data.scores || []);
     reportElement.innerHTML = renderMarkdown(currentReport);
@@ -399,6 +459,13 @@ function handleEvent(eventName, data) {
     results.hidden = false;
     runState.textContent = "DONE";
     results.scrollIntoView({ behavior: "smooth", block: "start" });
+    refreshTasks();
+  }
+  if (eventName === "interrupt") {
+    currentTaskId = data.task_id || currentTaskId;
+    if (currentTaskId) localStorage.setItem("projectAdvisorTaskId", currentTaskId);
+    showInteraction(data);
+    refreshTasks();
   }
   if (eventName === "error") {
     throw new Error(data.message || "评估失败");
@@ -434,8 +501,9 @@ form.addEventListener("submit", async (event) => {
   event.preventDefault();
   formError.textContent = "";
   const mode = getCandidateMode();
+  const interactive = mode === "auto" && allowClarificationInput.checked;
 
-  if (mode === "auto" && (!currentPlan || plannedQuestion !== questionInput.value.trim())) {
+  if (mode === "auto" && !interactive && (!currentPlan || plannedQuestion !== questionInput.value.trim())) {
     setRunning(true);
     runState.textContent = "PLANNING";
     controller = new AbortController();
@@ -466,11 +534,13 @@ form.addEventListener("submit", async (event) => {
     return;
   }
 
-  const candidates = mode === "auto"
+  const candidates = interactive
+    ? []
+    : mode === "auto"
     ? (currentPlan?.candidates || []).map((candidate) => candidate.name.trim()).filter(Boolean)
     : candidatesInput.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean);
   const uniqueCandidates = [...new Set(candidates)];
-  if (!uniqueCandidates.length) {
+  if (!interactive && !uniqueCandidates.length) {
     formError.textContent = mode === "auto" ? "请至少保留一个候选项目。" : "请填写至少一个候选项目。";
     return;
   }
@@ -483,6 +553,7 @@ form.addEventListener("submit", async (event) => {
   scoreGrid.innerHTML = "";
   reportElement.innerHTML = "";
   currentReport = "";
+  hideInteraction();
   diagnosticsCollectionState.textContent = "正在采集";
   resetTimeline();
   runState.textContent = "READY";
@@ -496,15 +567,21 @@ form.addEventListener("submit", async (event) => {
       body: JSON.stringify({
         question: questionInput.value,
         candidates: uniqueCandidates,
-        allow_clarification: false,
-        confirmed_plan: mode === "auto" ? currentPlan : null,
-        confirmed_candidates: true,
+        allow_clarification: interactive,
+        confirmed_plan: mode === "auto" && !interactive ? currentPlan : null,
+        confirmed_candidates: !interactive,
       }),
       signal: controller.signal,
     });
     await consumeEventStream(response);
   } catch (error) {
-    if (error.name !== "AbortError") {
+    if (error.name === "AbortError" && currentTaskId) {
+      showInteraction({
+        kind: "resume",
+        question: "连接已停止；已完成节点保存在 checkpoint 中。",
+      });
+      setTimeout(refreshTasks, 500);
+    } else {
       formError.textContent = error.message || "请求失败，请检查服务配置。";
       runState.textContent = "ERROR";
     }
@@ -514,7 +591,139 @@ form.addEventListener("submit", async (event) => {
   }
 });
 
+async function resumeCurrentTask() {
+  if (!currentTaskId || !pendingInterrupt) return;
+  const previousInterrupt = pendingInterrupt;
+  let responseValue = null;
+  if (previousInterrupt.kind === "candidate_confirmation") {
+    responseValue = {
+      candidates: [...new Set(
+        interactionAnswer.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean),
+      )],
+    };
+    if (!responseValue.candidates.length) {
+      formError.textContent = "请至少保留一个候选项目。";
+      return;
+    }
+  } else if (previousInterrupt.kind === "clarification") {
+    const answer = interactionAnswer.value.trim();
+    if (!answer) {
+      formError.textContent = "澄清回答不能为空。";
+      return;
+    }
+    responseValue = { answer };
+  }
+
+  formError.textContent = "";
+  hideInteraction();
+  setRunning(true);
+  controller = new AbortController();
+  try {
+    const response = await fetch(`/api/tasks/${encodeURIComponent(currentTaskId)}/resume`, {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ response: responseValue }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const errorPayload = await response.json().catch(() => ({}));
+      throw new Error(errorPayload.detail || `任务恢复失败（${response.status}）`);
+    }
+    await consumeEventStream(response);
+  } catch (error) {
+    if (error.name === "AbortError") {
+      showInteraction({ kind: "resume", question: "连接已停止，可从 checkpoint 继续。" });
+    } else {
+      formError.textContent = error.message || "任务恢复失败。";
+      showInteraction(previousInterrupt);
+      runState.textContent = "ERROR";
+    }
+  } finally {
+    controller = null;
+    setRunning(false);
+  }
+}
+
+async function openTask(taskId) {
+  const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+    headers: apiHeaders(),
+  });
+  if (!response.ok) throw new Error(`任务读取失败（${response.status}）`);
+  const task = await response.json();
+  currentTaskId = task.task_id;
+  localStorage.setItem("projectAdvisorTaskId", currentTaskId);
+  if (task.status === "completed") {
+    hideInteraction();
+    currentReport = task.report || "";
+    renderScores(task.scores || []);
+    reportElement.innerHTML = renderMarkdown(currentReport);
+    renderDiagnostics(task.diagnostics || {});
+    results.hidden = false;
+    runState.textContent = "DONE";
+    results.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (task.status === "waiting_input") {
+    showInteraction({ task_id: task.task_id, ...(task.pending_interrupt || {}) });
+  } else if (["paused", "failed"].includes(task.status)) {
+    showInteraction({
+      task_id: task.task_id,
+      kind: "resume",
+      question: task.error || "任务已保存，可以从 checkpoint 继续。",
+    });
+  } else {
+    runState.textContent = task.status.toUpperCase();
+    formError.textContent = "该任务仍在运行，请稍后刷新。";
+  }
+}
+
+function renderTaskHistory(tasks) {
+  taskHistoryList.innerHTML = "";
+  if (!tasks.length) {
+    taskHistoryList.innerHTML = "<p>暂无持久化任务。</p>";
+    return;
+  }
+  const statusLabels = {
+    queued: "排队中",
+    running: "运行中",
+    waiting_input: "等待输入",
+    paused: "已暂停",
+    failed: "失败可恢复",
+    completed: "已完成",
+  };
+  tasks.forEach((task) => {
+    const row = document.createElement("article");
+    row.className = "task-history-item";
+    const content = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = task.question;
+    const meta = document.createElement("small");
+    meta.textContent = `${statusLabels[task.status] || task.status} · ${new Date(task.updated_at).toLocaleString("zh-CN")}`;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary-button";
+    button.textContent = task.has_report ? "查看报告" : "打开任务";
+    button.addEventListener("click", () => {
+      openTask(task.task_id).catch((error) => { formError.textContent = error.message; });
+    });
+    content.append(title, meta);
+    row.append(content, button);
+    taskHistoryList.append(row);
+  });
+}
+
+async function refreshTasks() {
+  try {
+    const response = await fetch("/api/tasks?limit=10", { headers: apiHeaders() });
+    if (!response.ok) throw new Error();
+    const payload = await response.json();
+    renderTaskHistory(payload.tasks || []);
+  } catch (_) {
+    taskHistoryList.innerHTML = "<p>任务历史暂不可用，请确认服务已完成启动。</p>";
+  }
+}
+
 cancelButton.addEventListener("click", () => controller?.abort());
+continueButton.addEventListener("click", resumeCurrentTask);
+refreshTasksButton.addEventListener("click", refreshTasks);
 questionInput.addEventListener("input", () => {
   updateCharacterCount();
   if (getCandidateMode() === "auto" && plannedQuestion !== questionInput.value.trim()) {
@@ -522,6 +731,10 @@ questionInput.addEventListener("input", () => {
   }
 });
 candidateModeInputs.forEach((input) => input.addEventListener("change", updateCandidateMode));
+allowClarificationInput.addEventListener("change", () => {
+  resetCandidatePlan();
+  updateCandidateMode();
+});
 addCandidateButton.addEventListener("click", addCandidate);
 additionalCandidate.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
@@ -559,10 +772,18 @@ downloadButton.addEventListener("click", () => {
 });
 
 fetch("/api/health")
-  .then((response) => {
+  .then(async (response) => {
     if (!response.ok) throw new Error();
+    const payload = await response.json();
+    const modelRuntime = payload.model_runtime || {};
+    if (modelRuntime.status !== "ready") {
+      serviceStatus.classList.remove("online");
+      serviceStatus.classList.add("degraded");
+      serviceStatus.querySelector("span:last-child").textContent = "服务在线 · 模型未配置";
+      return;
+    }
     serviceStatus.classList.add("online");
-    serviceStatus.querySelector("span:last-child").textContent = "服务在线";
+    serviceStatus.querySelector("span:last-child").textContent = "服务在线 · 模型已配置";
   })
   .catch(() => { serviceStatus.querySelector("span:last-child").textContent = "服务离线"; });
 
@@ -579,3 +800,7 @@ fetch("/api/evaluation")
 
 updateCharacterCount();
 updateCandidateMode();
+refreshTasks();
+if (currentTaskId) {
+  openTask(currentTaskId).catch(() => {});
+}

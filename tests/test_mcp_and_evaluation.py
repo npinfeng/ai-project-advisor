@@ -17,13 +17,18 @@ from project_advisor.evaluation import (
     load_evaluation_file,
     normalize_evaluation_identifier,
 )
+from project_advisor.evaluation_suite import (
+    apply_golden_reviews,
+    load_golden_suite,
+)
 from project_advisor.mcp_client import (
     clear_mcp_tool_cache,
     get_mcp_diagnostics,
     get_mcp_tools,
 )
 from scripts.annotate_eval_results import finalize_annotations
-from scripts.capture_eval_results import _run_case
+from scripts.capture_eval_results import _preflight_release, _run_case
+from scripts.verify_release_acceptance import verify_release_acceptance
 
 
 def test_offline_evaluation_metrics():
@@ -146,6 +151,35 @@ def test_golden_suite_is_defined_before_execution():
         assert case["success_criteria"]
 
 
+def test_golden_suite_requires_per_case_independent_review(tmp_path):
+    draft_path = Path(__file__).parents[1] / "evals" / "golden_cases.json"
+    payload = json.loads(draft_path.read_text(encoding="utf-8"))
+    with pytest.raises(ValueError, match="尚未完成独立人工审核"):
+        load_golden_suite(draft_path, require_reviewed=True)
+
+    decisions = {
+        case["case_id"]: {
+            "decision": "approved",
+            "relevant_documents_verified": True,
+            "expected_citations_verified": True,
+            "success_criteria_verified": True,
+            "notes": "逐项核对",
+        }
+        for case in payload["cases"]
+    }
+    reviewed = apply_golden_reviews(
+        payload,
+        decisions,
+        reviewer="reviewer-b",
+    )
+    reviewed_path = tmp_path / "golden.reviewed.json"
+    reviewed_path.write_text(json.dumps(reviewed), encoding="utf-8")
+
+    loaded = load_golden_suite(reviewed_path, require_reviewed=True)
+    assert loaded.ground_truth_status == "reviewed"
+    assert all(case.human_review is not None for case in loaded.cases)
+
+
 def test_independent_annotation_is_required_before_publishable_evaluation():
     pending_payload = {
         "k": 5,
@@ -157,6 +191,14 @@ def test_independent_annotation_is_required_before_publishable_evaluation():
             "annotation_method": "none",
             "annotator": None,
             "is_publishable": False,
+            "golden_suite_name": "suite-v1",
+            "golden_suite_version": "1.0.0",
+            "golden_suite_sha256": "a" * 64,
+            "ground_truth_status": "reviewed",
+            "ground_truth_reviewer": "ground-truth-reviewer",
+            "ground_truth_reviewed_at": "2026-09-04T00:00:00+00:00",
+            "candidate_suggestion_exercised": True,
+            "recovery_exercised": True,
         },
         "cases": [{
             "case_id": "case-1",
@@ -168,6 +210,9 @@ def test_independent_annotation_is_required_before_publishable_evaluation():
             "supported_citations": [],
             "task_success": None,
             "latency_ms": 100,
+            "workflow_completed": True,
+            "run_error": None,
+            "report_sha256": "b" * 64,
             "annotation_context": {"success_criteria": "包含明确结论"},
         }],
     }
@@ -264,6 +309,157 @@ data: {"report":"结论 https://docs.example.com/generated","retrieved_evidences
     ]
     assert result["supported_citations"] == []
     assert result["task_success"] is None
+
+
+def test_capture_exercises_checkpoint_resume_path():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/advice/stream":
+            return httpx.Response(200, text=(
+                "event: started\n"
+                "data: {\"task_id\":\"task-release\"}\n\n"
+                "event: interrupt\n"
+                "data: {\"task_id\":\"task-release\",\"kind\":\"candidate_confirmation\"}\n\n"
+            ))
+        assert request.url.path == "/api/tasks/task-release/resume"
+        return httpx.Response(200, text=(
+            "event: result\n"
+            "data: {\"task_id\":\"task-release\",\"report\":\"# report https://docs.example.com/a\","
+            "\"retrieved_evidences\":[{\"evidence_id\":\"ev_a\",\"source_url\":\"https://docs.example.com/a\"}],"
+            "\"diagnostics\":{\"total_duration_ms\":12}}\n\n"
+        ))
+
+    async def capture() -> dict:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await _run_case(
+                client,
+                "http://testserver",
+                {
+                    "case_id": "case-release",
+                    "question": "请比较两个满足私有化要求的候选项目。",
+                    "candidates": ["A", "B"],
+                    "relevant_documents": ["https://docs.example.com/a"],
+                    "expected_citations": ["https://docs.example.com/a"],
+                    "success_criteria": "返回可验证报告",
+                },
+                10,
+                exercise_resume=True,
+            )
+
+    result = asyncio.run(capture())
+    assert result["workflow_completed"] is True
+    assert result["report_sha256"]
+    assert result["annotation_context"]["recovery_exercised"] is True
+    assert result["annotation_context"]["interrupt_kinds"] == [
+        "candidate_confirmation"
+    ]
+
+
+def test_release_preflight_requires_health_and_candidate_suggestion():
+    requested_paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path == "/api/health":
+            return httpx.Response(200, json={
+                "status": "ok",
+                "model_runtime": {"status": "ready"},
+                "persistence": {"status": "ready", "checkpoint_enabled": True},
+            })
+        return httpx.Response(200, json={
+            "requirements": {"language": "Python"},
+            "candidates": [{"name": "A", "reason": "match"}],
+        })
+
+    async def preflight() -> dict:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await _preflight_release(
+                client,
+                "http://testserver",
+                {"cases": [{"question": "请推荐适合生产部署的 Python Agent 框架。"}]},
+                10,
+            )
+
+    result = asyncio.run(preflight())
+    assert requested_paths == ["/api/health", "/api/candidates/suggest"]
+    assert result["suggested_candidate_count"] == 1
+
+
+def test_release_acceptance_binds_run_to_exact_reviewed_suite(tmp_path):
+    draft = {
+        "suite_name": "release-suite",
+        "version": "1.0.0",
+        "ground_truth_status": "draft_human_review_required",
+        "k": 5,
+        "cases": [{
+            "case_id": "release-case",
+            "question": "请比较两个适合生产部署的技术项目。",
+            "candidates": ["A", "B"],
+            "relevant_documents": ["https://docs.example.com/a"],
+            "expected_citations": ["https://docs.example.com/a"],
+            "success_criteria": "给出有引用支持的明确结论",
+        }],
+    }
+    reviewed = apply_golden_reviews(
+        draft,
+        {"release-case": {
+            "decision": "approved",
+            "relevant_documents_verified": True,
+            "expected_citations_verified": True,
+            "success_criteria_verified": True,
+        }},
+        reviewer="ground-truth-reviewer",
+    )
+    suite_path = tmp_path / "suite.reviewed.json"
+    suite_path.write_text(json.dumps(reviewed), encoding="utf-8")
+    from project_advisor.evaluation_suite import golden_suite_sha256
+
+    run = {
+        "k": 5,
+        "metadata": {
+            "dataset_name": "release-run",
+            "dataset_kind": "real_run",
+            "annotation_status": "reviewed",
+            "annotation_method": "independent_human",
+            "annotator": "output-reviewer",
+            "is_publishable": True,
+            "run_id": "run-1",
+            "model": "provider:model",
+            "golden_suite_name": "release-suite",
+            "golden_suite_version": "1.0.0",
+            "golden_suite_sha256": golden_suite_sha256(suite_path),
+            "ground_truth_status": "reviewed",
+            "ground_truth_reviewer": "ground-truth-reviewer",
+            "ground_truth_reviewed_at": reviewed["reviewed_at"],
+            "candidate_suggestion_exercised": True,
+            "recovery_exercised": True,
+        },
+        "cases": [{
+            "case_id": "release-case",
+            "relevant_documents": ["https://docs.example.com/a"],
+            "retrieved_documents": ["https://docs.example.com/a"],
+            "retrieved_evidence_ids": ["ev_a"],
+            "expected_citations": ["https://docs.example.com/a"],
+            "generated_citations": ["https://docs.example.com/a"],
+            "supported_citations": ["https://docs.example.com/a"],
+            "task_success": True,
+            "latency_ms": 100,
+            "workflow_completed": True,
+            "report_sha256": "c" * 64,
+        }],
+    }
+    run_path = tmp_path / "run.reviewed.json"
+    run_path.write_text(json.dumps(run), encoding="utf-8")
+
+    acceptance = verify_release_acceptance(suite_path, run_path)
+    assert acceptance["status"] == "pass"
+    assert all(check["passed"] for check in acceptance["checks"])
+
+    changed = json.loads(suite_path.read_text(encoding="utf-8"))
+    changed["cases"][0]["success_criteria"] = "已变更的标准"
+    suite_path.write_text(json.dumps(changed), encoding="utf-8")
+    rejected = verify_release_acceptance(suite_path, run_path)
+    assert rejected["status"] == "fail"
+    assert rejected["checks"][0]["passed"] is False
 
 
 def test_mcp_diagnostics_when_disabled():
