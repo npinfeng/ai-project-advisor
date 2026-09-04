@@ -248,18 +248,22 @@ def _check_framework_compatibility(
     deployment = (requirements.get("deployment") or "").strip().lower()
     required_features = [f.strip().lower() for f in (requirements.get("required_features") or [])]
 
-    # 已知框架能力（与 model_registry 保持一致）
+    # 已知框架能力（与 model_registry 保持一致）。
+    #
+    # 布尔值只用于能否满足硬约束；“需外部集成”仍然是支持，
+    # 不能和“不支持”混为一谈。RAG 本来就通常是编排框架 +
+    # retriever/vector store 的组合能力。
     framework_caps = {
         "langgraph": {"multi_agent": True, "mcp": True, "checkpoint": True,
-                      "hitl": True, "streaming": True, "rag": False, "offline": True},
+                      "hitl": True, "streaming": True, "rag": True, "offline": True},
         "crewai": {"multi_agent": True, "mcp": True, "checkpoint": False,
-                   "hitl": True, "streaming": False, "rag": False, "offline": True},
+                   "hitl": True, "streaming": False, "rag": True, "offline": True},
         "autogen": {"multi_agent": True, "mcp": True, "checkpoint": False,
-                    "hitl": True, "streaming": True, "rag": False, "offline": True},
+                    "hitl": True, "streaming": True, "rag": True, "offline": True},
         "dify": {"multi_agent": False, "mcp": False, "checkpoint": False,
                   "hitl": False, "streaming": True, "rag": True, "offline": True},
         "openai agents sdk": {"multi_agent": True, "mcp": True, "checkpoint": False,
-                              "hitl": False, "streaming": True, "rag": False, "offline": False},
+                              "hitl": False, "streaming": True, "rag": True, "offline": False},
     }
 
     feature_to_key = {

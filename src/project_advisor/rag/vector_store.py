@@ -26,16 +26,25 @@ class VectorStore:
         self,
         storage_dir: str = "./data/vector_store",
         collection_prefix: str = "project_advisor",
+        embedding_identity: Optional[str] = None,
+        embedding_metadata: Optional[dict] = None,
     ):
         """初始化向量存储。
 
         Args:
             storage_dir: 持久化目录
             collection_prefix: Collection 名称前缀
+            embedding_identity: 当前 Embedding 配置的稳定标识
+            embedding_metadata: 写入 Collection 的可观测模型元数据
         """
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.collection_prefix = collection_prefix
+        self.embedding_identity = embedding_identity
+        self.embedding_metadata = self._metadata_for_chroma(
+            embedding_metadata or {}
+        )
+        self._embedding_resets: set[str] = set()
 
         self._client = chromadb.PersistentClient(
             path=str(self.storage_dir),
@@ -43,6 +52,26 @@ class VectorStore:
         )
         self._collections: dict[str, chromadb.Collection] = {}
         self._discover_collections()
+
+    def _is_embedding_compatible(self, collection: chromadb.Collection) -> bool:
+        """Return whether persisted vectors match the active embedder settings."""
+        if not self.embedding_identity:
+            return True
+        metadata = getattr(collection, "metadata", None) or {}
+        return metadata.get("embedding_identity") == self.embedding_identity
+
+    def _discard_incompatible_collection(
+        self,
+        project_name: str,
+        collection: chromadb.Collection,
+    ) -> bool:
+        """Drop a derived vector index that cannot be queried by this embedder."""
+        if self._is_embedding_compatible(collection):
+            return False
+        self._client.delete_collection(name=collection.name)
+        self._collections.pop(project_name, None)
+        self._embedding_resets.add(project_name)
+        return True
 
     def _discover_collections(self) -> None:
         """Restore persisted project collections after a process restart."""
@@ -59,7 +88,7 @@ class VectorStore:
                 )
                 metadata = getattr(collection, "metadata", None) or {}
                 project_name = metadata.get("project")
-                if project_name:
+                if project_name and self._is_embedding_compatible(collection):
                     self._collections[str(project_name)] = collection
             except Exception:
                 continue
@@ -85,10 +114,19 @@ class VectorStore:
         collection_name = self._get_collection_name(project_name)
         try:
             collection = self._client.get_collection(name=collection_name)
+            if self._discard_incompatible_collection(project_name, collection):
+                raise KeyError("embedding configuration changed")
         except Exception:
+            metadata = {
+                "project": project_name,
+                "hnsw:space": "cosine",
+                **self.embedding_metadata,
+            }
+            if self.embedding_identity:
+                metadata["embedding_identity"] = self.embedding_identity
             collection = self._client.create_collection(
                 name=collection_name,
-                metadata={"project": project_name},
+                metadata=metadata,
             )
 
         self._collections[project_name] = collection
@@ -98,15 +136,27 @@ class VectorStore:
         self, project_name: str
     ) -> Optional[chromadb.Collection]:
         if project_name in self._collections:
-            return self._collections[project_name]
+            collection = self._collections[project_name]
+            if not self._discard_incompatible_collection(project_name, collection):
+                return collection
+            return None
         try:
             collection = self._client.get_collection(
                 name=self._get_collection_name(project_name)
             )
         except Exception:
             return None
+        if self._discard_incompatible_collection(project_name, collection):
+            return None
         self._collections[project_name] = collection
         return collection
+
+    def consume_embedding_reset(self, project_name: str) -> bool:
+        """Report once when a stale vector index was reset after a model change."""
+        if project_name not in self._embedding_resets:
+            return False
+        self._embedding_resets.remove(project_name)
+        return True
 
     @staticmethod
     def _metadata_for_chroma(metadata: dict) -> dict:

@@ -17,6 +17,7 @@ from langchain_core.tools import tool
 
 from project_advisor.configuration import Configuration
 from project_advisor.observability.logging import log_event
+from project_advisor.rag.embedder import Embedder
 from project_advisor.rag.ingestion import IngestionPipeline
 from project_advisor.rag.query_rewriter import QueryRewriter
 from project_advisor.rag.reranker import Reranker
@@ -28,10 +29,22 @@ _reranker: Optional[Reranker] = None
 logger = logging.getLogger(__name__)
 
 
-def _get_pipeline() -> IngestionPipeline:
+def _get_pipeline(config: Optional[Configuration] = None) -> IngestionPipeline:
     global _pipeline
-    if _pipeline is None:
-        _pipeline = IngestionPipeline()
+    configurable = config or Configuration.from_runnable_config()
+    embedder = Embedder(
+        model_name=configurable.embedding_model,
+        provider=configurable.embedding_provider,
+        normalize_embeddings=configurable.embedding_normalize,
+        query_instruction=configurable.embedding_query_instruction,
+    )
+    if (
+        _pipeline is None
+        or _pipeline.embedder.index_identity != embedder.index_identity
+    ):
+        if _pipeline is not None:
+            _pipeline.hybrid.vector_store.close()
+        _pipeline = IngestionPipeline(embedder=embedder)
     return _pipeline
 
 
@@ -100,7 +113,7 @@ def _sync_from_store(
     if not targets:
         return []
 
-    pipeline = _get_pipeline()
+    pipeline = _get_pipeline(configurable)
     sync_results = []
     for target in targets:
         if force:
@@ -143,12 +156,16 @@ async def rag_search(
     configurable = Configuration.from_runnable_config(config)
     # Keep synchronization callable with a single project argument so it remains
     # easy to replace in offline tests; environment policy is read inside it.
-    sync_results = await asyncio.to_thread(_sync_from_store, project_name)
+    sync_results = await asyncio.to_thread(
+        _sync_from_store,
+        project_name,
+        config=config,
+    )
     if not sync_results:
         scope = f"项目 {project_name}" if project_name else "任何项目"
         return f"本地知识库中还没有 {scope} 的持久化证据。"
 
-    pipeline = _get_pipeline()
+    pipeline = _get_pipeline(configurable)
     rewriter = _get_rewriter(configurable)
 
     # 生成多角度子查询
@@ -258,6 +275,8 @@ def rag_ingest(
         f"- 向量索引：{stats.get('vector_indexed', 0)}\n"
         f"- 向量总数：{stats.get('vector_total', 0)}\n"
         f"- 清理旧向量：{stats.get('vector_removed', 0)}\n"
+        f"- Embedding 变化触发重建："
+        f"{'是' if stats.get('vector_rebuilt_for_embedding_change') else '否'}\n"
         f"- BM25 索引：{stats.get('bm25_indexed', 0)}"
     )
 
@@ -311,7 +330,7 @@ def rag_maintain(
     report = store.maintain(project_name, policy=policy, dry_run=not apply)
     rebuilt: list[dict] = []
     if apply and report["affected_projects"]:
-        pipeline = _get_pipeline()
+        pipeline = _get_pipeline(configurable)
         for project in report["affected_projects"]:
             pipeline.hybrid.clear(project)
             current = store.get_current_by_project(project, policy=policy, max_results=100_000)
@@ -346,15 +365,13 @@ def rag_status(config: RunnableConfig = None) -> str:
     """
     from project_advisor.rag.document_store import DocumentStore
     from project_advisor.rag.evidence_lifecycle import EvidenceLifecyclePolicy
-    from project_advisor.rag.bm25_retriever import BM25Retriever
-    from project_advisor.rag.vector_store import VectorStore
 
     store = DocumentStore()
-    vs = VectorStore()
-    bm25 = BM25Retriever()
-
     store_stats = store.get_stats()
     configurable = Configuration.from_runnable_config(config)
+    pipeline = _get_pipeline(configurable)
+    vs = pipeline.hybrid.vector_store
+    bm25 = pipeline.hybrid.bm25
     policy = EvidenceLifecyclePolicy(
         stale_after_days=configurable.evidence_stale_after_days,
         expire_after_days=configurable.evidence_expire_after_days,
@@ -362,6 +379,9 @@ def rag_status(config: RunnableConfig = None) -> str:
 
     lines = [
         "RAG 知识库状态：\n",
+        f"Embedding：{configurable.embedding_provider}/"
+        f"{configurable.embedding_model}（归一化："
+        f"{'是' if configurable.embedding_normalize else '否'}）",
         f"存储目录：{store_stats['storage_dir']}",
         f"文档总数：{store_stats['total_documents']}",
         f"向量分块总数：{vs.count()}",

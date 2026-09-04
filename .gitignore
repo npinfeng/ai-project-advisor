@@ -10,6 +10,7 @@ __pycache__/
 .ruff_cache/
 *.md
 !docs/rag_benchmark.md
+!src/project_advisor/skills/**/SKILL.md
 
 .venv/
 venv/

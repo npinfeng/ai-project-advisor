@@ -315,8 +315,10 @@ async def get_repository_tools(config: RunnableConfig) -> list[Any]:
     """Return the least-privilege tool set for repository engineering research."""
     from project_advisor.state import ResearchComplete
     from project_advisor.tools.github import (
+        github_get_file,
         github_get_readme,
         github_get_repo,
+        github_list_directory,
         github_list_issues,
         github_list_releases,
     )
@@ -327,6 +329,8 @@ async def get_repository_tools(config: RunnableConfig) -> list[Any]:
         github_list_releases,
         github_list_issues,
         github_get_readme,
+        github_list_directory,
+        github_get_file,
     ]
     configurable = Configuration.from_runnable_config(config)
     tools.extend(await _get_allowlisted_mcp_tools(
@@ -341,6 +345,7 @@ async def get_documentation_tools(config: RunnableConfig) -> list[Any]:
     from project_advisor.state import ResearchComplete
     from project_advisor.tools.document_collector import (
         batch_fetch_tool,
+        web_discover_links,
         web_fetch_tool,
     )
     from project_advisor.tools.rag_search import rag_search
@@ -351,6 +356,7 @@ async def get_documentation_tools(config: RunnableConfig) -> list[Any]:
         ResearchComplete,
         web_fetch_tool,
         batch_fetch_tool,
+        web_discover_links,
         rag_search,
         model_info,
     ]

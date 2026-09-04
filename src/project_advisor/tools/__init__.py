@@ -7,6 +7,10 @@ _EXPORTS = {
     "fetch_webpage": ("project_advisor.tools.document_collector", "fetch_webpage"),
     "web_fetch_tool": ("project_advisor.tools.document_collector", "web_fetch_tool"),
     "batch_fetch_tool": ("project_advisor.tools.document_collector", "batch_fetch_tool"),
+    "web_discover_links": (
+        "project_advisor.tools.document_collector",
+        "web_discover_links",
+    ),
     "collect_documents": (
         "project_advisor.tools.document_collector",
         "collect_documents",
@@ -20,6 +24,11 @@ _EXPORTS = {
     "check_local_feasibility": (
         "project_advisor.tools.model_registry",
         "check_local_feasibility",
+    ),
+    "github_get_file": ("project_advisor.tools.github", "github_get_file"),
+    "github_list_directory": (
+        "project_advisor.tools.github",
+        "github_list_directory",
     ),
 }
 

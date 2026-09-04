@@ -170,6 +170,21 @@ async def fetch_webpage(url: str, timeout: int = 30) -> dict:
             # 使用 BeautifulSoup 提取正文
             soup = BeautifulSoup(html, "html.parser")
             source_date = extract_source_date(soup)
+            links = []
+            seen_links = set()
+            for anchor in soup.find_all("a", href=True):
+                resolved = urljoin(current_url, str(anchor["href"]).strip())
+                parsed_link = urlparse(resolved)
+                if parsed_link.scheme not in {"http", "https"}:
+                    continue
+                canonical = parsed_link._replace(fragment="").geturl()
+                if canonical in seen_links:
+                    continue
+                seen_links.add(canonical)
+                links.append({
+                    "url": canonical,
+                    "text": anchor.get_text(" ", strip=True)[:160],
+                })
 
             # 移除脚本和样式
             for tag in soup(["script", "style", "nav", "footer", "header"]):
@@ -202,6 +217,7 @@ async def fetch_webpage(url: str, timeout: int = 30) -> dict:
                 "content_type": content_type,
                 "status": response.status_code,
                 "source_date": source_date,
+                "links": links[:500],
             }
 
     except httpx.TimeoutException:
@@ -403,4 +419,44 @@ async def batch_fetch_tool(
             f"- 内容摘要：{ev.content[:500]}...\n"
         )
 
+    return "\n".join(lines)
+
+
+@tool(description=(
+    "发现网页中的 HTTP/HTTPS 链接，适合从官方文档首页定位安装、API、迁移、"
+    "安全和架构页面；默认仅返回同域链接。"
+))
+async def web_discover_links(
+    url: str,
+    keyword: str = "",
+    same_domain_only: bool = True,
+    limit: int = 30,
+) -> str:
+    """Discover and optionally filter links from a public web page."""
+    result = await fetch_webpage(url)
+    if result["status"] != 200:
+        return f"无法发现链接：{result['content']}"
+
+    source_host = (urlparse(result["url"]).hostname or "").lower()
+    needle = keyword.strip().casefold()
+    selected = []
+    for item in result.get("links", []):
+        target = str(item.get("url", ""))
+        label = str(item.get("text", ""))
+        target_host = (urlparse(target).hostname or "").lower()
+        if same_domain_only and target_host != source_host:
+            continue
+        if needle and needle not in f"{label} {target}".casefold():
+            continue
+        selected.append((label, target))
+
+    bounded_limit = max(1, min(int(limit), 100))
+    if not selected:
+        qualifier = f"且匹配关键词“{keyword}”" if needle else ""
+        return f"页面中未发现符合条件{qualifier}的链接：{result['url']}"
+    lines = [f"--- 页面链接：{result['url']} ---"]
+    for label, target in selected[:bounded_limit]:
+        lines.append(f"- {label or '(无链接文本)'}：{target}")
+    if len(selected) > bounded_limit:
+        lines.append(f"... [其余 {len(selected) - bounded_limit} 条未显示]")
     return "\n".join(lines)

@@ -48,4 +48,10 @@ where = ["src"]
 include = ["project_advisor*"]
 
 [tool.setuptools.package-data]
-project_advisor = ["py.typed", "static/*.html", "static/*.css", "static/*.js"]
+project_advisor = [
+    "py.typed",
+    "static/*.html",
+    "static/*.css",
+    "static/*.js",
+    "skills/*/SKILL.md",
+]

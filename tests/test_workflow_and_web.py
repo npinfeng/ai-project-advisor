@@ -15,7 +15,10 @@ from project_advisor.graph import (
     researcher_subgraph_repo,
 )
 from project_advisor.agents.planner import build_research_tasks
-from project_advisor.agents.reviewer import _bind_scores_to_evidence
+from project_advisor.agents.reviewer import (
+    _bind_scores_to_evidence,
+    _consolidate_review_gaps,
+)
 from project_advisor.schemas.evidence import (
     CandidateRecommendation,
     Evidence,
@@ -25,6 +28,7 @@ from project_advisor.schemas.evidence import (
 )
 from project_advisor.state import ResearchPlan
 from project_advisor.tools.evidence_factory import build_evidences_from_tool_result
+from project_advisor.tools.constraint_analyzer import analyze_feasibility
 
 
 def test_research_subgraphs_have_execution_loops():
@@ -75,6 +79,40 @@ def test_planner_expands_typed_tasks_and_gap_round_is_bounded():
         "supplemental_round_used": True,
     })
     assert final_gate["next"] == "review_and_score"
+
+
+def test_framework_rag_integration_satisfies_hard_constraint():
+    report = analyze_feasibility(
+        {"required_features": ["rag"]},
+        ["LangGraph", "AutoGen", "CrewAI"],
+    )
+
+    assert report.is_feasible is True
+    assert not any("不支持 'rag'" in item.description for item in report.violations)
+
+
+def test_evidence_coverage_targets_missing_hard_capabilities_without_calling_them_unsupported():
+    rag_evidence = Evidence(
+        source_url="https://docs.example.com/langgraph/rag",
+        source_type="official_documentation",
+        project_name="LangGraph",
+        content="Build RAG with a retriever and vector store inside a LangGraph workflow.",
+        relevance="feature_match",
+        retrieved_at="2026-09-04T00:00:00+00:00",
+    )
+
+    gaps = detect_evidence_gaps(
+        ["LangGraph"],
+        [rag_evidence],
+        {"LangGraph": None},
+        ["rag", "human_in_the_loop"],
+    )
+
+    assert len(gaps) == 1
+    assert gaps[0].track == "documentation"
+    assert "human_in_the_loop" in gaps[0].reason
+    assert "rag" not in gaps[0].reason.split("：", 1)[1].split("。", 1)[0]
+    assert "证据不足不代表框架不支持" in gaps[0].reason
 
 
 def test_manual_execution_plan_does_not_create_a_planner_model(monkeypatch):
@@ -153,6 +191,50 @@ def test_final_report_is_deterministic_and_does_not_create_a_model(monkeypatch):
     assert output["final_report"].startswith("# 技术选型评估报告")
     assert evidence.evidence_id in output["final_report"]
     assert evidence.source_url in output["final_report"]
+
+
+def test_context_compression_is_reported_as_process_note_not_evidence_gap(monkeypatch):
+    reviewer_module = importlib.import_module("project_advisor.agents.reviewer")
+    monkeypatch.setattr(
+        reviewer_module,
+        "create_chat_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected model call")),
+    )
+    output = asyncio.run(reviewer_module.generate_report({
+        "research_brief": "评估框架。",
+        "candidates": [],
+        "scores": [],
+        "evidences": [],
+        "review_analysis": "暂无。",
+        "review_evidence_gaps": [],
+        "context_budget": {
+            "compressed": True,
+            "omitted_or_duplicate_count": 4,
+        },
+    }, {}))
+
+    report = output["final_report"]
+    gap_section = report.split("## 7. 证据缺口", 1)[1].split("## 8.", 1)[0]
+    assert "上下文预算" not in gap_section
+    assert "## 8. 研究过程说明" in report
+    assert "不代表项目能力或证据缺失" in report
+
+
+def test_review_gaps_are_deduplicated_and_bounded_per_candidate():
+    gaps = [
+        "LangGraph: 缺少 RAG 官方文档。",
+        "LangGraph: 缺少 RAG 官方文档。",
+        "LangGraph: 缺少 HITL 官方文档。",
+        "LangGraph: 缺少部署文档。",
+        "LangGraph: 缺少基准数据。",
+        "CrewAI: 缺少持久化文档。",
+    ]
+
+    consolidated = _consolidate_review_gaps(gaps, ["LangGraph", "CrewAI"])
+
+    assert consolidated.count("LangGraph: 缺少 RAG 官方文档。") == 1
+    assert len([gap for gap in consolidated if "LangGraph" in gap]) == 3
+    assert "CrewAI: 缺少持久化文档。" in consolidated
 
 
 def test_tool_output_is_normalized_and_score_is_bound_to_evidence():
@@ -237,6 +319,8 @@ def test_reviewer_score_rubric_and_token_usage(monkeypatch):
     assert result.scores[0].learning_cost == 8
     assert "10 分=最容易上手" in captured["prompt"]
     assert "10 分=部署运维最简单" in captured["prompt"]
+    assert "没有找到直接证据" in captured["prompt"]
+    assert "evidence_gaps 最多列 2 条" in captured["prompt"]
     assert usage == {"input_tokens": 120, "output_tokens": 30}
 
 

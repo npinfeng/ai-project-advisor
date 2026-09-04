@@ -113,6 +113,46 @@ def _bind_scores_to_evidence(
     return bound_scores, gaps
 
 
+def _consolidate_review_gaps(
+    gaps: list[str],
+    candidates: list[str],
+    *,
+    max_per_candidate: int = 3,
+) -> list[str]:
+    """De-duplicate and bound decision-critical gaps in the final report."""
+    consolidated: list[str] = []
+    seen: set[str] = set()
+    counts = {candidate.casefold(): 0 for candidate in candidates}
+    max_total = max(4, min(12, len(candidates) * max_per_candidate))
+
+    for raw_gap in gaps:
+        gap = " ".join(str(raw_gap).strip().lstrip("-• ").split())
+        if not gap:
+            continue
+        fingerprint = gap.casefold().rstrip("。.;；")
+        if fingerprint in seen:
+            continue
+
+        owner = next(
+            (
+                candidate.casefold()
+                for candidate in candidates
+                if candidate.casefold() in fingerprint
+            ),
+            None,
+        )
+        if owner is not None and counts[owner] >= max_per_candidate:
+            continue
+        if len(consolidated) >= max_total:
+            break
+
+        seen.add(fingerprint)
+        if owner is not None:
+            counts[owner] += 1
+        consolidated.append(gap)
+    return consolidated
+
+
 async def _review_single_candidate(
     candidate: str,
     candidate_evidences: list[Evidence],
@@ -149,7 +189,11 @@ async def _review_single_candidate(
 - learning_cost 实际表示“易学性”：10 分=最容易上手/学习成本最低
 - deployment_cost 实际表示“部署经济性”：10 分=部署运维最简单/成本最低
 - 9-10=证据充分且表现优秀；7-8=明显良好；5-6=基本可用但有取舍；3-4=明显不足；1-2=不满足
-- 只能依据上面的证据，不可编造；证据不足的维度最高 5 分，并在 evidence_gaps 中说明
+- 只能依据上面的证据，不可编造；证据不足的维度最高 5 分
+- “没有找到直接证据”只表示本轮研究未证实，绝不等于项目“不支持”该能力
+- RAG 等组合能力可以由框架内建，也可以由官方生态/外部组件集成；有集成证据即视为能力支持
+- evidence_gaps 最多列 2 条，只保留会改变选型结论的关键待补证项；不要把每个普通指标、每条被截断内容分别列为缺口
+- 每条 evidence_gap 应描述“尚缺哪类证据”，不得仅凭缺少证据断言“不支持”“不可用”或“存在冲突”
 - 在 analysis 中简要总结该项目的核心优势、劣势和风险
 </评分说明>"""
 
@@ -211,7 +255,10 @@ async def _cross_compare(
 3. 关键风险提示
 4. 推荐的决策路径
 
-不需要重新评分，专注于交叉对比和场景适配。"""
+不需要重新评分，专注于交叉对比和场景适配。
+研究简报中的预检风险只是待验证假设，不能覆盖结构化证据。
+尤其不得把“本轮没有直接证据”改写成“不支持”“不能实现”或候选之间的结构性冲突；
+RAG 等通过官方生态或外部组件完成的集成能力也属于支持。"""
 
     compare_model = create_chat_model(
         configurable.final_report_model,
@@ -279,13 +326,16 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
     all_scores = []
     all_analyses = []
     all_evidence_gaps = []
-    for result in per_candidate_results:
+    for candidate, result in zip(candidates, per_candidate_results):
         if result.scores:
             all_scores.extend(result.scores)
         if result.analysis:
             all_analyses.append(result.analysis)
         if result.evidence_gaps:
-            all_evidence_gaps.extend(result.evidence_gaps)
+            all_evidence_gaps.extend(
+                f"{candidate}: {gap}"
+                for gap in result.evidence_gaps[:2]
+            )
 
     # === Stage 2: Cross-Comparison ===
     cross_analysis = ""
@@ -316,21 +366,15 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
     )
     ranked_scores = compare_projects(bound_scores, criteria)
 
-    all_gaps = list(dict.fromkeys([
+    all_gaps = _consolidate_review_gaps([
         *workflow_gaps,
         *all_evidence_gaps,
         *binding_gaps,
-    ]))
+    ], candidates)
     dropped_total = sum(
         item.get("dropped_for_budget", 0) + item.get("duplicate_count", 0)
         for item in context_diagnostics
     )
-    if dropped_total:
-        all_gaps.append(
-            f"Reviewer 上下文预算压缩了 {dropped_total} 条重复或低优先级证据；"
-            "完整证据仍保留在引用清单和持久化存储中。"
-        )
-
     # 拼接完整分析
     combined_analysis = "\n\n".join(all_analyses)
     if cross_analysis:
@@ -344,6 +388,7 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
         "context_budget": {
             "max_chars": configurable.reviewer_context_max_chars,
             "used_chars": sum(item.get("selected_chars", 0) for item in context_diagnostics),
+            "omitted_or_duplicate_count": dropped_total,
             "over_budget": any(item.get("over_budget", False) for item in context_diagnostics),
             "compressed": any(item.get("compressed", False) for item in context_diagnostics),
             "candidates": context_diagnostics,
@@ -414,6 +459,18 @@ async def generate_report(state: AgentState, config: RunnableConfig):
         "\n".join(f"- {gap}" for gap in gaps) or "- 未检测到明确缺口。",
     ])
 
+    next_section = 8
+    context_budget = state.get("context_budget", {})
+    if context_budget.get("compressed"):
+        omitted = int(context_budget.get("omitted_or_duplicate_count", 0) or 0)
+        detail = f"（去重或省略 {omitted} 条）" if omitted else ""
+        sections.extend([
+            f"## {next_section}. 研究过程说明",
+            f"- Reviewer 输入按来源权威性、新鲜度和置信度进行了去重与截断{detail}；"
+            "这属于上下文管理，不代表项目能力或证据缺失。完整证据仍保留在引用清单和持久化存储中。",
+        ])
+        next_section += 1
+
     if evidences:
         conflicts = detect_conflicts(evidences)
         if conflicts:
@@ -422,7 +479,8 @@ async def generate_report(state: AgentState, config: RunnableConfig):
             ])
         else:
             conflict_text = "- 未检测到来源冲突。"
-        sections.extend(["## 8. 来源冲突检测", conflict_text])
+        sections.extend([f"## {next_section}. 来源冲突检测", conflict_text])
+        next_section += 1
 
     source_lines = [
         f"- `{evidence.evidence_id}` [{evidence.project_name}] "
@@ -431,7 +489,7 @@ async def generate_report(state: AgentState, config: RunnableConfig):
         for evidence in evidences
     ]
     sections.extend([
-        "## 9. 信息来源",
+        f"## {next_section}. 信息来源",
         "\n".join(source_lines) or "- 没有可追溯来源。",
     ])
     report_content = "\n\n".join(sections)

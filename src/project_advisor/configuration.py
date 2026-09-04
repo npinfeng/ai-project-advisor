@@ -2,7 +2,7 @@
 
 import os
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, model_validator
@@ -122,6 +122,23 @@ class Configuration(BaseModel):
     final_report_model_max_tokens: int = Field(
         default=10000,
         description="最终报告模型最大输出 token 数",
+    )
+    embedding_provider: Literal["local", "openai"] = Field(
+        default="local",
+        description="Embedding 提供方：本地 Sentence Transformers 或 OpenAI 兼容接口",
+    )
+    embedding_model: str = Field(
+        default="BAAI/bge-m3",
+        min_length=1,
+        description="RAG 使用的中英混合 Embedding 模型",
+    )
+    embedding_normalize: bool = Field(
+        default=True,
+        description="是否对文档和 Query Embedding 做 L2 归一化",
+    )
+    embedding_query_instruction: str = Field(
+        default="",
+        description="仅添加到检索 Query 的模型指令；BGE-M3 应保持为空",
     )
 
     # ===== GitHub 配置 =====

@@ -542,10 +542,22 @@ def _component_quality(
     }
 
 
-def _build_embedder(provider: str, model_name: str, dimensions: int) -> EmbeddingProvider:
+def _build_embedder(
+    provider: str,
+    model_name: str,
+    dimensions: int,
+    *,
+    normalize_embeddings: bool = True,
+    query_instruction: str = "",
+) -> EmbeddingProvider:
     if provider == "hash":
         return HashEmbedder(dimensions)
-    return Embedder(model_name=model_name, provider=provider)
+    return Embedder(
+        model_name=model_name,
+        provider=provider,
+        normalize_embeddings=normalize_embeddings,
+        query_instruction=query_instruction,
+    )
 
 
 def _baseline_scenario(report: dict[str, Any], concurrency: int) -> dict[str, Any] | None:
@@ -825,7 +837,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--queries", type=int, default=100, help="Synthetic query count")
     parser.add_argument("--projects", type=int, default=10, help="Synthetic project count")
     parser.add_argument("--provider", choices=["hash", "local", "openai"], default="hash")
-    parser.add_argument("--model-name", default="all-MiniLM-L6-v2")
+    parser.add_argument("--model-name", default="BAAI/bge-m3")
+    parser.add_argument(
+        "--normalize-embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--query-instruction",
+        default="",
+        help="Prefix applied only to retrieval queries; BGE-M3 should keep this empty",
+    )
     parser.add_argument("--hash-dimensions", type=int, default=384)
     parser.add_argument("--chunk-size", type=int, default=1000)
     parser.add_argument("--chunk-overlap", type=int, default=200)
@@ -865,11 +887,21 @@ def main() -> None:
         )
         dataset_kind = "synthetic"
 
-    embedder = _build_embedder(args.provider, args.model_name, args.hash_dimensions)
+    embedder = _build_embedder(
+        args.provider,
+        args.model_name,
+        args.hash_dimensions,
+        normalize_embeddings=args.normalize_embeddings,
+        query_instruction=args.query_instruction,
+    )
     embedder_name = (
         f"hash:{args.hash_dimensions}"
         if args.provider == "hash"
-        else f"{args.provider}:{args.model_name}"
+        else (
+            f"{args.provider}:{args.model_name}:"
+            f"normalized={str(args.normalize_embeddings).lower()}:"
+            f"identity={embedder.index_identity}"
+        )
     )
     baseline = (
         json.loads(args.baseline.read_text(encoding="utf-8"))

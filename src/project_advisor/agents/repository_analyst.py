@@ -13,6 +13,7 @@ from langchain_core.runnables import RunnableConfig
 
 from project_advisor.configuration import Configuration
 from project_advisor.prompts import repo_analyst_system_prompt
+from project_advisor.skills import load_skills_for_role
 from project_advisor.state import ResearcherState
 from project_advisor.tools.execution import ToolExecutionRecord, execute_tool
 from project_advisor.usage_tracking import add_usage
@@ -34,6 +35,7 @@ async def repository_analyst(state: ResearcherState, config: RunnableConfig):
         raise ValueError("未配置任何工具。请在配置中启用搜索 API 或添加工具。")
 
     system_prompt = repo_analyst_system_prompt.format(date=get_today_str())
+    system_prompt += load_skills_for_role("repository")
 
     research_model = (
         create_chat_model(

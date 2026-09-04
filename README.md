@@ -1,17 +1,20 @@
 # AI Project Advisor
 
-一个面向技术团队的开源项目选型系统。它采用“薄 Multi-Agent、厚 Workflow”架构：两个专业 Research Agent 负责取证，一个无工具 Reviewer 负责结构化判断，其余调度、缺口检查、评分和报告均由确定性节点完成。
+一个面向技术团队的开源项目选型系统。它采用“薄 Multi-Agent、厚 Workflow”架构：Repository Analyst 与 Documentation Researcher 使用隔离工具集并行取证，无工具 Reviewer 只基于结构化 Evidence 生成七维分析与原始评分；确定性工作流负责强类型任务路由、硬约束逐项覆盖检查、最多一轮定向补证、证据绑定、加权总分、排名和 Markdown 报告。
 
 ## 核心能力
 
 - 专业化 Agent：Repository Analyst 和 Documentation Researcher 使用相互隔离的工具集。
+- 角色化 Skills：按研究员动态加载仓库尽调、依赖许可证、官方文档核验和 RAG 架构审查技能，不把无关技能注入上下文。
+- 深度取证工具：除仓库元数据外，可浏览/读取 GitHub 配置文件；可从官方文档入口按域名和关键词发现目标页面。
 - 有界 Tool Runtime：统一参数校验、超时、瞬时错误重试、单轮 fan-out 上限和结构化执行记录。
 - 受限 Reviewer：只能读取规范化 Evidence，不具备工具权限，也不能决定权重和最终排名。
 - 证据驱动：统一 `Evidence` 模型记录来源、时间、版本、置信度与评估维度。
+- 定向补证：按 RAG、人在回环、状态持久化等硬约束逐项检查直接证据；区分“内建”“可集成”“明确不支持”和“尚未证实”，避免把证据缺失误判为能力缺失。
 - 确定性评分：LLM 负责分析证据，程序按配置权重计算最终分数和排名。
-- Hybrid RAG：BM25、向量检索、RRF 融合、查询改写和 Reranker。
+- 持久化 Hybrid RAG：Evidence 同步进入 Chroma 向量索引与 BM25，经过 RRF、查询改写和 Reranker 返回结果；默认使用可配置的 BGE-M3 多语言 Embedding，并在模型配置变化时自动重建不兼容向量索引。
 - MCP：内置真实 stdio Server，并支持服务端配置额外 stdio / HTTP Server。
-- Web 应用：FastAPI + SSE 推送阶段进度，支持停止、恢复、复制和下载报告。
+- Web 应用：FastAPI + SSE 推送阶段进度，支持中止当前 SSE 接收、暂停后恢复、复制和下载报告；提供 API Key 鉴权、进程内并发/速率限制、Token/成本门禁和 Web 抓取 SSRF 防护。
 - 可恢复工作流：SQLite 保存 LangGraph checkpoint 和任务状态，支持多轮澄清、候选确认与服务重启后继续。
 - 可观测性：页面展示总耗时、阶段耗时、候选数、引用数、MCP 状态、Token 和成本。
 - 关联日志：并发运行时通过 ContextVar 隔离 `task_id`、`research_task_id`、候选项目和 Tool Call 上下文。
@@ -138,7 +141,7 @@ Research Agent 不再接收全部 MCP 工具。只有工具名出现在对应角
 - 生命周期：Evidence 分为 active/stale/expired/invalid；expired 和非法 URL 不进入索引；
 - 手动维护：`rag_ingest` 同步指定项目，`rag_rebuild` 强制重建；`rag_maintain` 默认只预览，显式 `apply=true` 才清理 expired/invalid 数据并重建受影响索引。
 
-Reviewer 会按来源权威性、新鲜度和置信度选择证据，压缩重复内容，并严格遵守总字符预算。预算和生命周期阈值可通过 `REVIEWER_CONTEXT_MAX_CHARS`、`REVIEWER_EVIDENCE_MAX_CHARS`、`EVIDENCE_STALE_AFTER_DAYS`、`EVIDENCE_EXPIRE_AFTER_DAYS` 配置；裁剪详情写入运行诊断与报告证据缺口。
+Reviewer 会按来源权威性、新鲜度和置信度选择证据，压缩重复内容，并严格遵守总字符预算。预算和生命周期阈值可通过 `REVIEWER_CONTEXT_MAX_CHARS`、`REVIEWER_EVIDENCE_MAX_CHARS`、`EVIDENCE_STALE_AFTER_DAYS`、`EVIDENCE_EXPIRE_AFTER_DAYS` 配置；裁剪详情写入运行诊断和报告的“研究过程说明”，不再作为项目能力的证据缺口。
 
 ### 任务与 checkpoint
 
@@ -259,7 +262,7 @@ C:\miniconda\envs\agent\python.exe -m pytest tests -v -p no:cacheprovider
 ```
 
 MCP 集成测试会实际启动内置 stdio Server、发现工具并调用 `estimate_llm_cost`，不是 Mock 测试。
-当前完整回归结果为 `73 passed`。测试覆盖专业化工具隔离、Tool 参数校验/超时/重试/fan-out 限制、Agent Run 端到端超时、Reviewer 上下文预算、RAG 五组消融、Evidence 生命周期与版本冲突、Golden Case 独立审核门禁、真实发布预检与套件哈希绑定、异步 RAG、Reranker 并发闸门、日志上下文隔离、领域异常映射、确定性任务展开、单次补充研究门禁、手动候选结构化计划、健康状态降级、无模型报告渲染、Evidence 重启恢复、SQLite checkpoint/任务存储恢复、孤儿任务恢复、SSE 中断恢复、BM25/Chroma 持久化、SSE 真实 Evidence 采集和可信评测闭环。
+当前完整回归结果为 `86 passed`。测试覆盖专业化工具隔离、角色 Skill 加载、仓库文件/目录读取、文档链接发现、Tool 参数校验/超时/重试/fan-out 限制、Agent Run 端到端超时、Reviewer 上下文预算、RAG 五组消融、Evidence 生命周期与版本冲突、Golden Case 独立审核门禁、真实发布预检与套件哈希绑定、异步 RAG、Reranker 并发闸门、日志上下文隔离、领域异常映射、确定性任务展开、硬约束定向补证、证据缺口收敛、单次补充研究门禁、手动候选结构化计划、健康状态降级、无模型报告渲染、Evidence 重启恢复、SQLite checkpoint/任务存储恢复、孤儿任务恢复、SSE 中断恢复、BM25/Chroma 持久化、SSE 真实 Evidence 采集和可信评测闭环。
 
 ## 故障降级演示
 
@@ -292,6 +295,7 @@ src/project_advisor/
 ├── agents/          # Planner、Researcher、Reviewer
 ├── observability/   # 关联日志、Token/耗时/成本诊断
 ├── rag/             # Hybrid RAG
+├── skills/          # 按研究员角色动态加载的 SKILL.md
 ├── schemas/         # Evidence、评分与结构化结果
 ├── static/          # Web 页面、样式和交互
 ├── tools/           # GitHub、搜索、文档、评分、引用

@@ -1,8 +1,11 @@
 """Tests for the persistent Evidence and Hybrid RAG data loop."""
 
+import pytest
+
 from project_advisor.rag.bm25_retriever import BM25Retriever
 from project_advisor.rag.chunker import DocumentChunker
 from project_advisor.rag.document_store import DocumentStore
+from project_advisor.rag.embedder import Embedder
 from project_advisor.rag.hybrid_retriever import HybridRetriever
 from project_advisor.rag.knowledge_store import persist_evidences
 from project_advisor.rag.vector_store import VectorStore
@@ -12,17 +15,53 @@ from project_advisor.schemas.evidence import Evidence
 class FakeEmbedder:
     """Small deterministic embedder that keeps persistence tests offline."""
 
-    @staticmethod
-    def embed(text: str) -> list[float]:
+    def __init__(self, identity: str = "fake-v1", dimensions: int = 3):
+        self.index_identity = identity
+        self.index_metadata = {
+            "embedding_identity": identity,
+            "embedding_model": identity,
+        }
+        self.dimensions = dimensions
+
+    def embed(self, text: str) -> list[float]:
         lowered = text.lower()
-        return [
+        values = [
             float(len(text)),
             float(lowered.count("checkpoint")),
             float(lowered.count("agent")),
         ]
+        return (values + [0.0] * self.dimensions)[:self.dimensions]
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         return [self.embed(text) for text in texts]
+
+
+def test_embedder_separates_query_instruction_and_normalizes_vectors():
+    class CapturingModel:
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, texts, *, normalize_embeddings):
+            self.calls.append((list(texts), normalize_embeddings))
+            return [[3.0, 4.0] for _ in texts]
+
+    model = CapturingModel()
+    embedder = Embedder(
+        model_name="BAAI/bge-base-zh-v1.5",
+        query_instruction="为这个句子生成表示以用于检索相关文章：",
+    )
+    embedder._model = model
+
+    query_vector = embedder.embed_query("如何恢复工作流？")
+    document_vectors = embedder.embed_documents(["Checkpoint 可以恢复工作流。"])
+
+    assert model.calls == [
+        (["为这个句子生成表示以用于检索相关文章：如何恢复工作流？"], True),
+        (["Checkpoint 可以恢复工作流。"], True),
+    ]
+    assert query_vector == pytest.approx([0.6, 0.8])
+    assert document_vectors[0] == pytest.approx([0.6, 0.8])
+    assert embedder.index_metadata["embedding_model"] == "BAAI/bge-base-zh-v1.5"
 
 
 def make_evidence(content: str = "LangGraph supports durable checkpoint state.") -> Evidence:
@@ -128,6 +167,47 @@ def test_hybrid_indexes_are_idempotent_and_restore_across_restart(tmp_path):
     assert second_stats["vector_total"] == first_stats["chunks"]
     assert results
     assert len({result["id"] for result in results}) == len(results)
+
+
+def test_embedding_identity_change_rebuilds_persisted_vectors(tmp_path):
+    vector_dir = tmp_path / "vector-model-migration"
+    bm25_dir = tmp_path / "bm25-model-migration"
+    documents = [{
+        "content": "中文问题对应 English checkpoint documentation.",
+        "source_url": "https://docs.example.com/checkpoint",
+        "project_name": "LangGraph",
+    }]
+
+    first_embedder = FakeEmbedder(identity="minilm-v1", dimensions=3)
+    first = HybridRetriever(
+        embedder=first_embedder,
+        vector_store=VectorStore(
+            storage_dir=str(vector_dir),
+            embedding_identity=first_embedder.index_identity,
+            embedding_metadata=first_embedder.index_metadata,
+        ),
+        bm25=BM25Retriever(storage_dir=bm25_dir),
+    )
+    assert first.index_documents("LangGraph", documents)["vector_indexed"] == 1
+    first.vector_store.close()
+
+    second_embedder = FakeEmbedder(identity="bge-m3-v1", dimensions=4)
+    second = HybridRetriever(
+        embedder=second_embedder,
+        vector_store=VectorStore(
+            storage_dir=str(vector_dir),
+            embedding_identity=second_embedder.index_identity,
+            embedding_metadata=second_embedder.index_metadata,
+        ),
+        bm25=BM25Retriever(storage_dir=bm25_dir),
+    )
+    stats = second.index_documents("LangGraph", documents)
+
+    assert stats["vector_rebuilt_for_embedding_change"] is True
+    assert stats["vector_indexed"] == 1
+    assert stats["vector_total"] == 1
+    collection = second.vector_store._get_existing_collection("LangGraph")
+    assert collection.metadata["embedding_identity"] == "bge-m3-v1"
 
 
 def test_vector_store_batches_upserts_above_client_limit(tmp_path):

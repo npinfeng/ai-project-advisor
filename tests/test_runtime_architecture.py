@@ -8,6 +8,7 @@ import logging
 from langchain_core.messages import AIMessage
 
 from project_advisor.api.schemas import AdviceRequest
+from project_advisor.configuration import Configuration
 from project_advisor.errors import (
     AgentRunTimeoutError,
     ModelConfigurationError,
@@ -27,6 +28,15 @@ from project_advisor.rag.reranker import RelevanceScore, Reranker
 def test_app_reexports_extracted_request_schema():
     app_module = importlib.import_module("project_advisor.app")
     assert app_module.AdviceRequest is AdviceRequest
+
+
+def test_default_embedding_targets_multilingual_bge_m3():
+    config = Configuration()
+
+    assert config.embedding_provider == "local"
+    assert config.embedding_model == "BAAI/bge-m3"
+    assert config.embedding_normalize is True
+    assert config.embedding_query_instruction == ""
 
 
 def test_domain_errors_keep_legacy_exception_compatibility():
@@ -145,9 +155,9 @@ def test_rag_search_is_async_and_does_not_use_asyncio_run(monkeypatch):
     monkeypatch.setattr(
         rag_module,
         "_sync_from_store",
-        lambda project_name: [{"project_name": project_name}],
+        lambda project_name, **kwargs: [{"project_name": project_name}],
     )
-    monkeypatch.setattr(rag_module, "_get_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(rag_module, "_get_pipeline", lambda config=None: FakePipeline())
     monkeypatch.setattr(rag_module, "_get_rewriter", lambda config: FakeRewriter())
     monkeypatch.setattr(rag_module, "_get_reranker", lambda config: FakeReranker())
 

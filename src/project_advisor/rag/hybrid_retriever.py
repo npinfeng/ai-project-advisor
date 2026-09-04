@@ -289,7 +289,10 @@ class HybridRetriever:
         """
         self.embedder = embedder or Embedder()
         self.chunker = chunker or DocumentChunker()
-        self.vector_store = vector_store or VectorStore()
+        self.vector_store = vector_store or VectorStore(
+            embedding_identity=getattr(self.embedder, "index_identity", None),
+            embedding_metadata=getattr(self.embedder, "index_metadata", None),
+        )
         self.bm25 = bm25 or BM25Retriever()
         self.vector_weight = vector_weight
         self.bm25_weight = bm25_weight
@@ -319,6 +322,7 @@ class HybridRetriever:
                 "vector_indexed": 0,
                 "vector_removed": 0,
                 "vector_total": 0,
+                "vector_rebuilt_for_embedding_change": False,
                 "bm25_indexed": 0,
             }
 
@@ -328,12 +332,17 @@ class HybridRetriever:
         # 2. 仅向量化新增 chunk，删除内容更新后遗留的旧 chunk。
         expected_ids = {chunk["id"] for chunk in chunks}
         existing_ids = self.vector_store.document_ids(project_name)
+        embedding_reset = self.vector_store.consume_embedding_reset(project_name)
         stale_ids = existing_ids - expected_ids
         missing_chunks = [chunk for chunk in chunks if chunk["id"] not in existing_ids]
         removed_count = self.vector_store.delete_documents(project_name, stale_ids)
         if missing_chunks:
-            embeddings = self.embedder.embed_batch(
-                [chunk["text"] for chunk in missing_chunks]
+            texts = [chunk["text"] for chunk in missing_chunks]
+            embed_documents = getattr(self.embedder, "embed_documents", None)
+            embeddings = (
+                embed_documents(texts)
+                if callable(embed_documents)
+                else self.embedder.embed_batch(texts)
             )
             vector_count = self.vector_store.add_documents(
                 project_name, missing_chunks, embeddings
@@ -349,6 +358,7 @@ class HybridRetriever:
             "vector_indexed": vector_count,
             "vector_removed": removed_count,
             "vector_total": self.vector_store.count(project_name),
+            "vector_rebuilt_for_embedding_change": embedding_reset,
             "bm25_indexed": self.bm25.count(project_name),
         }
 
@@ -371,7 +381,10 @@ class HybridRetriever:
             融合后的搜索结果列表
         """
         # 1. 向量检索
-        query_embedding = self.embedder.embed(query)
+        embed_query = getattr(self.embedder, "embed_query", None)
+        query_embedding = (
+            embed_query(query) if callable(embed_query) else self.embedder.embed(query)
+        )
         candidate_count = max(top_k, top_k * self.candidate_pool_factor)
         vector_results = self.vector_store.search(
             query_embedding,
