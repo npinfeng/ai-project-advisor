@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from langchain_core.tools import tool
+from project_advisor.tools.source_result import SourceDocument, source_tool as tool, sourced
 
 from project_advisor.schemas.evidence import Evidence
 from project_advisor.utils import get_iso_timestamp
@@ -323,9 +323,11 @@ async def collect_documents(
             if result["status"] != 200:
                 return None
 
-            content = truncate_content(result["content"], max_chars_per_doc)
+            # Provenance stores source text only; display-only truncation notices
+            # must not become quotable evidence.
+            content = result["content"][:max_chars_per_doc]
             doc_type = detect_document_type(
-                url, result["title"], result["content"]
+                result["url"], result["title"], result["content"]
             )
 
             return Evidence(
@@ -338,6 +340,8 @@ async def collect_documents(
                 retrieved_at=get_iso_timestamp(),
                 source_date=result.get("source_date"),
                 version_info=None,
+                evidence_kind="primary",
+                truncated=len(result["content"]) > max_chars_per_doc,
             )
 
     tasks = [fetch_one(url) for url in urls]
@@ -367,7 +371,7 @@ async def web_fetch_tool(url: str) -> str:
 
     content = truncate_content(result["content"], 8000)
 
-    return f"""--- 网页内容 ---
+    observation = f"""--- 网页内容 ---
 URL：{result['url']}
 标题：{result['title']}
 域名：{extract_domain(url)}
@@ -380,6 +384,11 @@ URL：{result['url']}
 {content}
 </untrusted_web_content>
 """
+    return sourced(observation, [SourceDocument(
+        source_url=result["url"], content=result["content"][:8000],
+        source_type=detect_document_type(result["url"], result["title"], result["content"]),
+        source_date=result.get("source_date"), truncated=len(result["content"]) > 8000,
+    )])
 
 
 @tool(description="Batch fetch content from multiple URLs. Use this to gather documentation from several sources at once.")
@@ -419,7 +428,10 @@ async def batch_fetch_tool(
             f"- 内容摘要：{ev.content[:500]}...\n"
         )
 
-    return "\n".join(lines)
+    return sourced("\n".join(lines), [
+        SourceDocument(**ev.model_dump(include=set(SourceDocument.model_fields)))
+        for ev in evidence_list
+    ])
 
 
 @tool(description=(
@@ -459,4 +471,7 @@ async def web_discover_links(
         lines.append(f"- {label or '(无链接文本)'}：{target}")
     if len(selected) > bounded_limit:
         lines.append(f"... [其余 {len(selected) - bounded_limit} 条未显示]")
-    return "\n".join(lines)
+    return sourced("\n".join(lines), [SourceDocument(
+        source_url=result["url"], content="\n".join(lines),
+        source_type="web_search", evidence_kind="discovery",
+    )])

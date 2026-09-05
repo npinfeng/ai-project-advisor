@@ -25,6 +25,8 @@ from project_advisor.schemas.evidence import (
     ProjectScore,
     Requirements,
     ReviewResult,
+    RequirementVerdict,
+    EvidenceCitation,
 )
 from project_advisor.state import ResearchPlan
 from project_advisor.tools.evidence_factory import build_evidences_from_tool_result
@@ -97,6 +99,7 @@ def test_evidence_coverage_targets_missing_hard_capabilities_without_calling_the
         source_type="official_documentation",
         project_name="LangGraph",
         content="Build RAG with a retriever and vector store inside a LangGraph workflow.",
+        evidence_kind="primary",
         relevance="feature_match",
         retrieved_at="2026-09-04T00:00:00+00:00",
     )
@@ -106,6 +109,8 @@ def test_evidence_coverage_targets_missing_hard_capabilities_without_calling_the
         [rag_evidence],
         {"LangGraph": None},
         ["rag", "human_in_the_loop"],
+        [RequirementVerdict(project_name="LangGraph", requirement="rag", status="integration",
+            citations=[EvidenceCitation(evidence_id=rag_evidence.evidence_id, quote=rag_evidence.content)])],
     )
 
     assert len(gaps) == 1
@@ -252,8 +257,10 @@ def test_tool_output_is_normalized_and_score_is_bound_to_evidence():
     )
 
     assert evidences[0].evidence_id.startswith("ev_")
-    assert scores[0].evidence_ids == [evidences[0].evidence_id]
-    assert scores[0].source_urls == ["https://github.com/langchain-ai/langgraph"]
+    # A legacy URL and aggregate score do not establish a per-dimension citation.
+    assert scores[0].evidence_ids == []
+    assert scores[0].source_urls == []
+    assert scores[0].feature_match == 5
     assert scores[1].project_name == "CrewAI"
     assert scores[1].evidence_confidence == "insufficient"
     assert gaps

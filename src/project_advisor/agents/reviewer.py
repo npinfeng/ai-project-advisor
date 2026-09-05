@@ -14,6 +14,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from project_advisor.agents.context_budget import build_evidence_payload
+from project_advisor.agents.requirement_verifier import (
+    eligibility, required_items, validate_citations, validate_verdicts,
+)
 from project_advisor.configuration import Configuration
 from project_advisor.schemas.evidence import Evidence, ProjectScore, ReviewResult
 from project_advisor.state import AgentState
@@ -52,7 +55,6 @@ def _evidence_for_project(project_name: str, evidences: list[Evidence]) -> list[
         evidence
         for evidence in evidences
         if target == evidence.project_name.casefold().strip()
-        or target in evidence.project_name.casefold()
     ]
 
 
@@ -60,6 +62,8 @@ def _bind_scores_to_evidence(
     scores: list[ProjectScore],
     candidates: list[str],
     evidences: list[Evidence],
+    requirements: list[str] | None = None,
+    requirement_verdicts: list | None = None,
 ) -> tuple[list[ProjectScore], list[str]]:
     """Force one score per confirmed candidate and attach quality-validated references.
 
@@ -80,11 +84,32 @@ def _bind_scores_to_evidence(
             gaps.append(f"{candidate} 缺少结构化评分。")
 
         matched = _evidence_for_project(candidate, evidences)
-        evidence_ids = [evidence.evidence_id for evidence in matched]
-        source_urls = list(dict.fromkeys(evidence.source_url for evidence in matched))
+        evidence_map = {e.evidence_id: e for e in matched}
+        rationales = []
+        dimensions = ["feature_match", "engineering_reliability", "community_and_maintenance",
+                      "documentation_quality", "learning_cost", "extensibility", "deployment_cost"]
+        updates = {}
+        for dimension in dimensions:
+            entries = [r for r in score.dimension_rationales if r.dimension == dimension]
+            # Duplicate rationales are ambiguous; require one grounded judgment per dimension.
+            citations = validate_citations(entries[0].citations, evidence_map, candidate) if len(entries) == 1 else []
+            if citations:
+                rationales.append(entries[0].model_copy(update={"citations": citations}))
+            else:
+                updates[dimension] = min(getattr(score, dimension), 5.0)
+        evidence_ids = list(dict.fromkeys(c.evidence_id for r in rationales for c in r.citations))
+        source_urls = list(dict.fromkeys(evidence_map[key].source_url for key in evidence_ids))
+        if len(rationales) < len(dimensions):
+            gaps.append(f"{candidate} 部分评分缺少逐维原文依据，相关维度已限制为最高 5 分。")
+        verdicts = validate_verdicts(candidate, requirements or [], requirement_verdicts or [], matched)
+        gate = eligibility(verdicts)
 
         # 使用质量加权置信度计算（替代纯数量逻辑）
-        confidence, confidence_score = compute_evidence_confidence(matched)
+        confidence, confidence_score = compute_evidence_confidence([evidence_map[key] for key in evidence_ids])
+        if not evidence_ids:
+            confidence = "insufficient"
+        if confidence == "insufficient" and gate == "eligible":
+            gate = "conditional"
 
         if confidence == "insufficient":
             gaps.append(
@@ -103,10 +128,15 @@ def _bind_scores_to_evidence(
         bound_scores.append(
             score.model_copy(
                 update={
+                    **updates,
                     "project_name": candidate,
                     "evidence_ids": evidence_ids,
                     "source_urls": source_urls,
                     "evidence_confidence": confidence,
+                    "dimension_rationales": rationales,
+                    "requirement_verdicts": verdicts,
+                    "eligibility": gate,
+                    "justification": "；".join(r.reason for r in rationales) or "缺少通过校验的逐维评分依据。",
                 }
             )
         )
@@ -161,6 +191,7 @@ async def _review_single_candidate(
     *,
     context_max_chars: int | None = None,
     diagnostics_sink: list[dict] | None = None,
+    requirement_verdicts: list | None = None,
 ) -> tuple[ReviewResult, dict[str, int]]:
     """Stage 1: 对单个候选项目的结构化评分（低认知负荷）。"""
     evidence_payload, context_diagnostics = build_evidence_payload(
@@ -184,6 +215,10 @@ async def _review_single_candidate(
 {json.dumps(evidence_payload, ensure_ascii=False, separators=(',', ':')) if evidence_payload else '暂无证据'}
 </结构化证据>
 
+<硬约束核验>
+{json.dumps([v.model_dump() if hasattr(v, 'model_dump') else v for v in (requirement_verdicts or [])], ensure_ascii=False)}
+</硬约束核验>
+
 <评分说明>
 - 所有维度都是“越高越好”：10 分代表最符合需求，1 分代表基本不可用
 - learning_cost 实际表示“易学性”：10 分=最容易上手/学习成本最低
@@ -195,6 +230,9 @@ async def _review_single_candidate(
 - evidence_gaps 最多列 2 条，只保留会改变选型结论的关键待补证项；不要把每个普通指标、每条被截断内容分别列为缺口
 - 每条 evidence_gap 应描述“尚缺哪类证据”，不得仅凭缺少证据断言“不支持”“不可用”或“存在冲突”
 - 在 analysis 中简要总结该项目的核心优势、劣势和风险
+- 每个评分维度提供一个 dimension_rationales：dimension、reason、citations（evidence_id + quote）。quote 必须逐字复制完整支撑句，保留否定和条件，禁止从其他候选借用结论。
+- 只有 evidence_kind=primary 的原文可以支撑确定评分。搜索摘要、目录链接、推断和旧的未验证记录仅作线索；无原文依据的维度最高 5 分。
+- analysis 中每项事实标注对应 evidence_id；区分原文事实与推断。首选资格由程序依据硬约束核验决定，勿用高分覆盖 unsupported/unknown/conflicting。
 </评分说明>"""
 
     reviewer_model = (
@@ -221,69 +259,28 @@ async def _review_single_candidate(
         max_attempts=configurable.max_structured_output_retries,
     )
     usage_values = [get_message_token_usage(raw) for raw in raw_responses]
+    visible_map = {item["evidence_id"]: Evidence.model_validate(item) for item in evidence_payload}
+    result.scores = [s for s in result.scores if s.project_name.casefold().strip() == candidate.casefold().strip()]
+    for score in result.scores:
+        score.dimension_rationales = [r.model_copy(update={
+            "citations": validate_citations(r.citations, visible_map, candidate)
+        }) for r in score.dimension_rationales]
     return result, add_usage(*usage_values)
-
-
-async def _cross_compare(
-    candidates: list[str],
-    per_candidate_results: list[ReviewResult],
-    research_brief: str,
-    configurable: Configuration,
-) -> tuple[str, dict[str, int]]:
-    """Stage 2: 跨项目对比与综合分析（只看摘要，不看完整证据）。"""
-    summaries = []
-    for i, result in enumerate(per_candidate_results):
-        candidate = candidates[i] if i < len(candidates) else f"候选项目 {i}"
-        summaries.append(
-            f"### {candidate}\n{result.analysis[:800]}\n"
-            f"证据缺口：{'; '.join(result.evidence_gaps[:5]) if result.evidence_gaps else '无'}"
-        )
-
-    compare_prompt = f"""基于以下各候选项目的独立分析摘要，进行综合对比。
-
-<研究简报>
-{research_brief[:2000]}
-</研究简报>
-
-<各项目分析摘要>
-{chr(10).join(summaries)}
-</各项目分析摘要>
-
-请提供：
-1. 各项目的相对优劣势对比
-2. 不同场景下的最佳选择（如"追求稳定选X，追求创新选Y"）
-3. 关键风险提示
-4. 推荐的决策路径
-
-不需要重新评分，专注于交叉对比和场景适配。
-研究简报中的预检风险只是待验证假设，不能覆盖结构化证据。
-尤其不得把“本轮没有直接证据”改写成“不支持”“不能实现”或候选之间的结构性冲突；
-RAG 等通过官方生态或外部组件完成的集成能力也属于支持。"""
-
-    compare_model = create_chat_model(
-        configurable.final_report_model,
-        max_tokens=min(configurable.final_report_model_max_tokens, 4000),
-        timeout_seconds=configurable.llm_timeout_seconds,
-    ).with_retry(stop_after_attempt=configurable.max_structured_output_retries)
-    response = await compare_model.ainvoke([
-        SystemMessage(content="你是技术选型对比分析专家。基于独立评估结果进行交叉对比。"),
-        HumanMessage(content=compare_prompt),
-    ])
-    content = response.content if hasattr(response, "content") else str(response)
-    return content, get_message_token_usage(response)
 
 
 async def review_and_score(state: AgentState, config: RunnableConfig):
     """多阶段结构化评审 Pipeline — 替代单次 LLM 调用的高风险模式。
 
     Stage 1: Per-Candidate Scoring — 每个候选项目独立评分（低认知负荷）
-    Stage 2: Cross-Comparison — 基于摘要的交叉对比和场景分析
-    Stage 3: Deterministic Binding — 评分绑定、加权排序、缺口汇总
+    Stage 2: Deterministic Binding — 逐维引用校验、硬约束门禁、加权排序
+    Stage 3: Grounded Summary — 仅从通过校验的评分理由生成摘要
     """
     candidates = state.get("candidates", [])
     research_brief = state.get("research_brief", "")
     evidences = _normalize_evidences(state.get("evidences", []))
     configurable = Configuration.from_runnable_config(config)
+    requirements = required_items(state.get("requirements"))
+    verdicts = state.get("requirement_verdicts", [])
 
     # 构建证据缺口
     workflow_gaps = []
@@ -315,6 +312,7 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
                 configurable,
                 context_max_chars=per_candidate_budget,
                 diagnostics_sink=context_diagnostics,
+                requirement_verdicts=validate_verdicts(candidate, requirements, verdicts, candidate_evidences),
             )
         )
 
@@ -324,33 +322,18 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
 
     # 合并所有候选的评分
     all_scores = []
-    all_analyses = []
     all_evidence_gaps = []
     for candidate, result in zip(candidates, per_candidate_results):
         if result.scores:
-            all_scores.extend(result.scores)
-        if result.analysis:
-            all_analyses.append(result.analysis)
+            all_scores.extend(s for s in result.scores if s.project_name.casefold().strip() == candidate.casefold().strip())
         if result.evidence_gaps:
             all_evidence_gaps.extend(
                 f"{candidate}: {gap}"
                 for gap in result.evidence_gaps[:2]
             )
 
-    # === Stage 2: Cross-Comparison ===
-    cross_analysis = ""
-    if len(candidates) > 1:
-        try:
-            cross_analysis, cross_usage = await _cross_compare(
-                candidates, per_candidate_results, research_brief, configurable
-            )
-            usage_values.append(cross_usage)
-        except Exception as error:
-            all_evidence_gaps.append(
-                f"跨项目对比阶段失败：{type(error).__name__}。独立评分仍然有效。"
-            )
-
-    # === Stage 3: Deterministic Binding ===
+    # Unstructured cross-comparison is not published as verified factual claims.
+    # === Stage 2: Deterministic Binding ===
     weights = {
         "weight_feature_match": configurable.weight_feature_match,
         "weight_engineering_reliability": configurable.weight_engineering_reliability,
@@ -362,7 +345,7 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
     }
     criteria = create_criteria_from_config(weights)
     bound_scores, binding_gaps = _bind_scores_to_evidence(
-        all_scores, candidates, evidences
+        all_scores, candidates, evidences, requirements, verdicts
     )
     ranked_scores = compare_projects(bound_scores, criteria)
 
@@ -375,10 +358,13 @@ async def review_and_score(state: AgentState, config: RunnableConfig):
         item.get("dropped_for_budget", 0) + item.get("duplicate_count", 0)
         for item in context_diagnostics
     )
-    # 拼接完整分析
-    combined_analysis = "\n\n".join(all_analyses)
-    if cross_analysis:
-        combined_analysis += f"\n\n## 交叉对比分析\n{cross_analysis}"
+    combined_analysis = "\n\n".join(
+        f"### {score.project_name}\n" + ("\n".join(
+            f"- {r.dimension}：{r.reason}（证据：{', '.join(c.evidence_id for c in r.citations)}）"
+            for r in score.dimension_rationales
+        ) or "- 尚无通过原文引用校验的评分理由。")
+        for score in ranked_scores
+    )
 
     return {
         "evaluation_criteria": criteria,
@@ -407,15 +393,23 @@ async def generate_report(state: AgentState, config: RunnableConfig):
     score_table = format_score_table(scores) if scores else "暂无结构化评分。"
     analysis = state.get("review_analysis", "暂无 Reviewer 分析。")
     gaps = state.get("review_evidence_gaps", [])
+    # Recheck gates on resume too; never trust a model-supplied eligibility flag.
+    for score in scores:
+        checked = validate_verdicts(score.project_name, required_items(state.get("requirements")),
+                                   state.get("requirement_verdicts", []), evidences)
+        score.requirement_verdicts = checked
+        score.eligibility = eligibility(checked)
+        if score.evidence_confidence == "insufficient" and score.eligibility == "eligible":
+            score.eligibility = "conditional"
     eligible_scores = [
         score
         for score in scores
-        if score.evidence_confidence != "insufficient"
+        if score.evidence_confidence != "insufficient" and score.eligibility == "eligible"
     ]
     winner = (
         eligible_scores[0].project_name
         if eligible_scores
-        else "证据不足，暂不推荐"
+        else "尚无已验证满足全部硬约束的候选，暂不作确定推荐"
     )
     sections = [
         "# 技术选型评估报告",
@@ -430,10 +424,13 @@ async def generate_report(state: AgentState, config: RunnableConfig):
         "## 5. 推荐结果",
         f"- **当前首选**：{winner}",
         "- 排名由配置权重确定性计算；Reviewer 只提供结构化维度分。",
+        "- 明确违反硬约束的候选不具备首选资格；未知或冲突的候选仅供有条件考察。",
     ]
 
     score_map = {score.project_name.casefold(): score for score in scores}
     details = []
+    status_labels = {"built_in": "内建支持", "integration": "需集成", "unsupported": "明确不支持",
+                     "unknown": "尚未证实", "conflicting": "来源冲突"}
     for candidate in candidates:
         score = score_map.get(candidate.casefold())
         if score is None:
@@ -450,9 +447,20 @@ async def generate_report(state: AgentState, config: RunnableConfig):
             f"- 部署经济性（高分表示部署成本低）：{score.deployment_cost}/10\n"
             f"- **加权总分：{score.weighted_total}/10**\n"
             f"- 证据置信度：{score.evidence_confidence}\n"
+            f"- 推荐资格：{ {'eligible': '满足已核验硬约束', 'conditional': '有条件考察，需补证', 'excluded': '违反硬约束，不可作为首选'}[score.eligibility]}\n"
             f"- 评分依据：{score.justification}\n"
             f"- 证据 ID：{', '.join(score.evidence_ids) or '无'}"
         )
+        for verdict in score.requirement_verdicts:
+            details.append(f"- 硬约束「{verdict.requirement}」：{status_labels[verdict.status]}；"
+                           f"版本：{verdict.applicable_version or '未明确'}；{verdict.reason}")
+            for citation in verdict.citations:
+                details.append(f"  - `{citation.evidence_id}` [{citation.source_url}]({citation.source_url}) "
+                               f"（字符 {citation.start_char}–{citation.end_char}）：{citation.quote}")
+        for rationale in score.dimension_rationales:
+            details.append(f"- {rationale.dimension} 依据：{rationale.reason}")
+            for citation in rationale.citations:
+                details.append(f"  - `{citation.evidence_id}` [{citation.source_url}]({citation.source_url})：{citation.quote}")
     sections.extend(["## 6. 候选项目详情", "\n\n".join(details) or "暂无详情。"])
     sections.extend([
         "## 7. 证据缺口",

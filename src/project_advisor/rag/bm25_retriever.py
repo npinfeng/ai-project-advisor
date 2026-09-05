@@ -9,11 +9,12 @@
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 from typing import Optional
 
-from rank_bm25 import BM25Okapi
+from rank_bm25 import BM25L
+
+from project_advisor.rag.text_analysis import lexical_tokens
 
 
 class BM25Retriever:
@@ -43,7 +44,10 @@ class BM25Retriever:
         self._indexes[project_name] = {
             "corpus": corpus,
             "tokenized": tokenized,
-            "bm25": BM25Okapi(tokenized),
+            # BM25Okapi produces a negative score for an exact hit in a
+            # single-document corpus. BM25L remains well-defined for the small
+            # per-project indexes used by this application.
+            "bm25": BM25L(tokenized),
             "metadata": [chunk.get("metadata", {}) for chunk in chunks],
             "ids": [
                 chunk.get("id")
@@ -88,16 +92,8 @@ class BM25Retriever:
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        """简单分词：小写化 + 按非字母数字字符分割。
-
-        针对代码和技术文档优化：
-        - 保留 CamelCase 和 snake_case 的完整形式
-        - 保留版本号（如 v2.0、1.5.3）
-        """
-        text_lower = text.lower()
-        # 保留点号连接的版本号
-        tokens = re.findall(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", text_lower)
-        return [t for t in tokens if len(t) > 1]
+        """Tokenize Chinese phrases and Latin/API/version terms consistently."""
+        return lexical_tokens(text)
 
     def index(
         self,
@@ -136,7 +132,7 @@ class BM25Retriever:
         if not query_tokens:
             return []
 
-        all_results = []
+        raw_results = []
 
         projects = (
             [project_name] if project_name else list(self._indexes.keys())
@@ -150,21 +146,36 @@ class BM25Retriever:
             bm25 = index_data["bm25"]
             scores = bm25.get_scores(query_tokens)
 
-            # 归一化分数到 0-1 范围
-            max_score = max(scores) if len(scores) > 0 and max(scores) > 0 else 1.0
-            normalized = scores / max_score
-
-            for i, score in enumerate(normalized):
-                if score > 0:
-                    all_results.append({
+            # BM25L uses a positive delta baseline, so explicitly reject
+            # documents with no lexical overlap before normalizing scores.
+            query_set = set(query_tokens)
+            matching = [
+                i for i, tokens in enumerate(index_data["tokenized"])
+                if query_set.intersection(tokens)
+            ]
+            for i in matching:
+                raw_score = float(scores[i])
+                if raw_score > 0:
+                    overlap = len(query_set.intersection(index_data["tokenized"][i])) / len(query_set)
+                    raw_results.append({
                         "id": index_data["ids"][i],
                         "text": index_data["corpus"][i],
                         "metadata": index_data["metadata"][i],
-                        "score": float(score),
+                        "score": raw_score,
+                        "lexical_overlap": overlap,
                         "project": proj,
                     })
 
-        all_results.sort(key=lambda x: x["score"], reverse=True)
+        # Normalize once across the complete search scope. Per-project
+        # normalization incorrectly made every project's best result score 1.0.
+        max_score = max((item["score"] for item in raw_results), default=0.0)
+        all_results = [
+            {**item, "score": item["score"] / max_score}
+            for item in raw_results
+        ] if max_score > 0 else []
+        all_results.sort(
+            key=lambda x: (-x["score"], -x["lexical_overlap"], str(x["id"]))
+        )
         return all_results[:top_k]
 
     def clear_project(self, project_name: str):

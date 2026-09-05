@@ -8,6 +8,10 @@ from project_advisor.schemas.evidence import (
     Requirement,
     Requirements,
     ReviewResult,
+    EvidenceCitation,
+    RequirementVerdict,
+    RequirementAssessment,
+    DimensionRationale,
 )
 
 __all__ = [
@@ -18,4 +22,8 @@ __all__ = [
     "EvaluationCriteria",
     "ProjectScore",
     "ReviewResult",
+    "EvidenceCitation",
+    "RequirementVerdict",
+    "RequirementAssessment",
+    "DimensionRationale",
 ]

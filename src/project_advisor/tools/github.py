@@ -6,7 +6,7 @@ from typing import Optional
 from urllib.parse import quote
 
 import httpx
-from langchain_core.tools import tool
+from project_advisor.tools.source_result import SourceDocument, source_tool as tool, sourced
 
 from project_advisor import __version__
 
@@ -94,7 +94,7 @@ async def github_get_repo(github_url: str) -> str:
 
         data = response.json()
 
-        return f"""--- GitHub 仓库：{owner}/{repo} ---
+        observation = f"""--- GitHub 仓库：{owner}/{repo} ---
 名称：{data.get('full_name')}
 描述：{data.get('description', '无')}
 主页：{data.get('homepage', '无')}
@@ -111,6 +111,10 @@ Watchers：{data.get('watchers_count', 0)}
 默认分支：{data.get('default_branch', 'unknown')}
 Topics：{', '.join(data.get('topics', [])) if data.get('topics') else '无'}
 """
+        return sourced(observation, [SourceDocument(
+            source_url=f"https://github.com/{owner}/{repo}", content=observation,
+            source_type="github", source_date=data.get("updated_at"),
+        )])
 
 
 @tool(description="获取仓库的 Release 列表，包括版本号、发布日期和变更说明。")
@@ -141,6 +145,7 @@ async def github_list_releases(github_url: str, per_page: int = 5) -> str:
             return f"仓库 {owner}/{repo} 没有发布过 Release。"
 
         lines = [f"--- {owner}/{repo} 最近 {len(releases)} 个 Release ---"]
+        documents = []
         for rel in releases:
             name = rel.get("name") or rel.get("tag_name", "未知")
             published = rel.get("published_at", "未知")
@@ -150,8 +155,14 @@ async def github_list_releases(github_url: str, per_page: int = 5) -> str:
             lines.append(f"发布日期：{published}")
             if body:
                 lines.append(f"变更摘要：{body}")
+            documents.append(SourceDocument(
+                source_url=rel.get("html_url") or f"https://github.com/{owner}/{repo}/releases/tag/{quote(rel.get('tag_name', ''), safe='')}",
+                content=f"{name}{prerelease}\n{(rel.get('body') or '')[:8000]}",
+                source_type="release_note", source_date=rel.get("published_at"),
+                version_info=rel.get("tag_name"), truncated=len(rel.get("body") or "") > 8000,
+            ))
 
-        return "\n".join(lines)
+        return sourced("\n".join(lines), documents)
 
 
 @tool(description="获取仓库的 Issue 列表，可过滤状态（open/closed）和标签。")
@@ -193,6 +204,7 @@ async def github_list_issues(
         real_issues = [i for i in issues if "pull_request" not in i]
 
         lines = [f"--- {owner}/{repo} 的 {state} Issue（共 {len(real_issues)} 个）---"]
+        documents = []
 
         for issue in real_issues[:per_page]:
             title = issue.get("title", "无标题")
@@ -205,8 +217,14 @@ async def github_list_issues(
                 f"#{issue.get('number')}: {title}{label_str}\n"
                 f"  创建：{created} | 更新：{updated} | 评论数：{comments}"
             )
+            documents.append(SourceDocument(
+                source_url=issue.get("html_url") or f"https://github.com/{owner}/{repo}/issues/{issue.get('number')}",
+                content=lines[-1] + "\n" + (issue.get("body") or "")[:4000],
+                source_type="issue", source_date=issue.get("updated_at"),
+                truncated=len(issue.get("body") or "") > 4000,
+            ))
 
-        return "\n".join(lines)
+        return sourced("\n".join(lines), documents)
 
 
 @tool(description="获取仓库的 README 内容（Markdown 格式）。")
@@ -235,10 +253,14 @@ async def github_get_readme(github_url: str) -> str:
         data = response.json()
         content = base64.b64decode(data.get("content", "")).decode("utf-8", errors="replace")
 
-        if len(content) > 8000:
-            content = content[:8000] + "\n\n... [README 过长，已截断至前 8000 字符]"
+        truncated = len(content) > 8000
+        content = content[:8000]
+        note = "\n\n... [README 过长，已截断至前 8000 字符]" if truncated else ""
 
-        return f"--- {owner}/{repo} README ---\n\n{content}"
+        return sourced(f"--- {owner}/{repo} README ---\n\n{content}{note}", [SourceDocument(
+            source_url=data.get("html_url") or f"{GITHUB_API_BASE}/repos/{owner}/{repo}/readme",
+            content=content, source_type="github", locator=data.get("path", "README"), truncated=truncated,
+        )])
 
 
 @tool(description=(
@@ -293,12 +315,17 @@ async def github_get_file(
         )
         resolved_ref = ref.strip() or "默认分支"
         source_url = data.get("html_url") or (
-            f"https://github.com/{owner}/{repo}/blob/{resolved_ref}/{normalized_path}"
+            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{encoded_path}"
+            + (f"?ref={quote(ref.strip(), safe='')}" if ref.strip() else "")
         )
-        return (
+        observation = (
             f"--- {owner}/{repo} 文件：{normalized_path} ---\n"
             f"Ref：{resolved_ref}\n来源：{source_url}\n\n{content}{suffix}"
         )
+        return sourced(observation, [SourceDocument(
+            source_url=source_url, content=content, source_type="github",
+            version_info=ref.strip() or None, locator=normalized_path, truncated=truncated,
+        )])
 
 
 @tool(description=(
@@ -350,4 +377,8 @@ async def github_list_directory(
             lines.append(f"- [{kind}] {item_path}{size}")
         if len(ordered) > bounded_limit:
             lines.append(f"... [其余 {len(ordered) - bounded_limit} 项未显示]")
-        return "\n".join(lines)
+        return sourced("\n".join(lines), [SourceDocument(
+            source_url=endpoint + (f"?ref={quote(ref.strip(), safe='')}" if ref.strip() else ""),
+            content="\n".join(lines), source_type="github", evidence_kind="discovery",
+            locator=normalized_path, version_info=ref.strip() or None,
+        )])

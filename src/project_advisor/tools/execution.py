@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 import httpx
 from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import ToolMessage
 from pydantic import BaseModel, Field, ValidationError
 
 from project_advisor.configuration import Configuration
@@ -177,10 +178,15 @@ async def execute_tool(
         nested_usage = {"input_tokens": 0, "output_tokens": 0}
         try:
             with usage_scope() as nested_usage:
+                invocation = args
+                if getattr(tool, "response_format", "") == "content_and_artifact":
+                    invocation = {"type": "tool_call", "name": name, "id": call_id or name, "args": args}
                 result = await asyncio.wait_for(
-                    tool.ainvoke(args, config),
+                    tool.ainvoke(invocation, config),
                     timeout=configurable.tool_timeout_seconds,
                 )
+            artifact = result.artifact if isinstance(result, ToolMessage) else None
+            result = result.content if isinstance(result, ToolMessage) else result
             reported_error = _reported_error(result)
             if reported_error is not None:
                 raise reported_error
@@ -201,6 +207,7 @@ async def execute_tool(
                     tool_name=name,
                     args=args,
                     result=result,
+                    artifact=artifact,
                     project_name=project_name,
                     research_topic=research_topic,
                 ),

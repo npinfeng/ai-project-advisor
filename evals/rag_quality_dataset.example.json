@@ -1,0 +1,53 @@
+{
+  "schema_version": 3,
+  "metadata": {
+    "name": "replace-with-corpus-name",
+    "kind": "real",
+    "annotation_status": "draft_human_review_required",
+    "annotation_method": "",
+    "dataset_author": "replace-with-dataset-author",
+    "annotator": "",
+    "reviewed_at": "",
+    "snapshot_at": "2026-09-05T00:00:00+00:00",
+    "query_source": "replace-with-deidentified-real-query-source",
+    "corpus_version": "replace-with-immutable-corpus-version",
+    "privacy_status": "pending",
+    "guideline_version": "qrels-v1"
+  },
+  "documents": [
+    {
+      "id": "replace-doc-permissions",
+      "project_name": "replace-project",
+      "content": "Replace this with the exact snapshotted source passage.",
+      "source_url": "https://docs.example.com/replace-permissions",
+      "source_type": "official_documentation"
+    },
+    {
+      "id": "replace-doc-retrieval",
+      "project_name": "replace-project",
+      "content": "Replace this with a hard-negative or another relevant passage.",
+      "source_url": "https://docs.example.com/replace-retrieval",
+      "source_type": "official_documentation"
+    }
+  ],
+  "queries": [
+    {
+      "id": "replace-query-001",
+      "query": "替换为经过脱敏的真实中文查询",
+      "language": "zh-CN",
+      "category": "permissions",
+      "project_name": "replace-project",
+      "qrels": [
+        {
+          "document_id": "replace-doc-permissions",
+          "relevance": 3
+        },
+        {
+          "document_id": "replace-doc-retrieval",
+          "relevance": 0
+        }
+      ],
+      "rewritten_queries": []
+    }
+  ]
+}

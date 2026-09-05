@@ -7,6 +7,7 @@ from project_advisor.rag.chunker import DocumentChunker
 from project_advisor.rag.document_store import DocumentStore
 from project_advisor.rag.embedder import Embedder
 from project_advisor.rag.hybrid_retriever import HybridRetriever
+from project_advisor.rag.text_analysis import lexical_tokens
 from project_advisor.rag.knowledge_store import persist_evidences
 from project_advisor.rag.vector_store import VectorStore
 from project_advisor.schemas.evidence import Evidence
@@ -34,6 +35,13 @@ class FakeEmbedder:
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         return [self.embed(text) for text in texts]
+
+
+def test_multilingual_tokenizer_keeps_chinese_and_technical_compounds():
+    tokens = lexical_tokens("LangGraph 支持中文检索与 multi-agent v2.0")
+
+    assert {"langgraph", "lang", "graph", "中文", "文检", "检索"} <= set(tokens)
+    assert {"multi-agent", "multi", "agent", "v2.0", "v2", "0"} <= set(tokens)
 
 
 def test_embedder_separates_query_instruction_and_normalizes_vectors():
@@ -125,6 +133,39 @@ def test_chunk_and_bm25_ids_are_stable_after_restart(tmp_path):
 
     assert restarted.count("AllProjects") == len(chunks)
     assert results[0]["id"] == chunks[0]["id"]
+
+
+def test_bm25_retrieves_and_ranks_chinese_in_a_single_project_index(tmp_path):
+    bm25 = BM25Retriever(storage_dir=tmp_path / "bm25-zh")
+    chunks = [
+        {"id": "permissions", "text": "系统提供租户级权限过滤和访问控制。"},
+        {"id": "retrieval", "text": "系统支持中文混合检索、向量召回与关键词排序。"},
+        {"id": "observability", "text": "系统提供链路追踪和运行指标。"},
+    ]
+    bm25.index("中文项目", chunks)
+
+    results = bm25.search("中文检索排序", project_name="中文项目", top_k=3)
+
+    assert results
+    assert results[0]["id"] == "retrieval"
+    assert results[0]["lexical_overlap"] > 0
+    assert all(result["id"] != "observability" for result in results)
+
+    single = BM25Retriever(storage_dir=tmp_path / "bm25-single-zh")
+    single.index("单文档", [{"id": "only", "text": "支持中文检索。"}])
+    assert single.search("中文检索", project_name="单文档")[0]["id"] == "only"
+
+
+def test_bm25_cross_project_sorting_uses_one_global_score_scale(tmp_path):
+    bm25 = BM25Retriever(storage_dir=tmp_path / "bm25-cross-project")
+    bm25.index("弱匹配", [{"id": "weak", "text": "仅介绍中文界面。"}])
+    bm25.index("强匹配", [{"id": "strong", "text": "中文检索排序支持关键词召回。"}])
+
+    results = bm25.search("中文检索排序", top_k=2)
+
+    assert [result["id"] for result in results] == ["strong", "weak"]
+    assert results[0]["score"] == pytest.approx(1.0)
+    assert results[0]["score"] > results[1]["score"]
 
 
 def test_hybrid_indexes_are_idempotent_and_restore_across_restart(tmp_path):

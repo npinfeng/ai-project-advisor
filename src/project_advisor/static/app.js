@@ -53,6 +53,7 @@ const stageOrder = [
   "confirm_plan",
   "feasibility_check",
   "parallel_research",
+  "verify_requirements",
   "evidence_coverage",
   "supplemental_research",
   "review_and_score",
@@ -405,6 +406,13 @@ function renderScores(scores) {
     fill.style.width = `${Math.max(0, Math.min(total * 10, 100))}%`;
     bar.append(fill);
     card.append(header, bar);
+    const eligibilityLabel = document.createElement("p");
+    eligibilityLabel.textContent = {
+      eligible: "满足已核验硬约束",
+      conditional: "有条件考察：仍需补证",
+      excluded: "违反硬约束：不可作为首选",
+    }[score.eligibility] || "尚未核验推荐资格";
+    card.append(eligibilityLabel);
     scoreGrid.append(card);
   });
 }

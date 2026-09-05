@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from project_advisor.observability.logging import log_event
+from project_advisor.rag.text_analysis import lexical_overlap
 from project_advisor.usage_tracking import record_message_usage
 from project_advisor.utils import invoke_structured_with_retry
 
@@ -168,7 +169,18 @@ class Reranker:
             for i, doc in enumerate(documents):
                 doc["rerank_score"] = score_map.get(i, 5)
 
-            documents.sort(
-                key=lambda x: x.get("rerank_score", 5), reverse=True
-            )
+        # LLM failures and rounded scores commonly tie. Use multilingual lexical
+        # coverage and the fused retrieval score as deterministic tie-breakers.
+        for index, document in enumerate(documents):
+            document["lexical_score"] = lexical_overlap(query, document.get("text", ""))
+            document.setdefault("_original_rank", index)
+        documents.sort(key=lambda item: (
+            -float(item.get("rerank_score", 5)),
+            -float(item.get("lexical_score", 0)),
+            -float(item.get("multi_query_score", item.get("hybrid_score", item.get("rrf_score", item.get("score", 0))))),
+            int(item.get("_original_rank", 0)),
+            str(item.get("id", "")),
+        ))
+        for document in documents:
+            document.pop("_original_rank", None)
         return documents[:top_k]

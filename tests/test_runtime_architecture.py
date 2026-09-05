@@ -124,6 +124,19 @@ def test_reranker_limits_concurrent_model_calls():
     assert all(result["rerank_score"] == 8 for result in results)
 
 
+def test_reranker_uses_chinese_relevance_then_retrieval_score_for_ties():
+    reranker = Reranker(use_llm=False)
+    documents = [
+        {"id": "unrelated", "text": "英文社区活跃度与版本发布。", "multi_query_score": 0.99},
+        {"id": "lower", "text": "中文检索可用。", "multi_query_score": 0.40},
+        {"id": "higher", "text": "中文检索可用。", "multi_query_score": 0.80},
+    ]
+
+    results = asyncio.run(reranker.rerank("中文检索", documents, top_k=3))
+
+    assert [item["id"] for item in results] == ["higher", "lower", "unrelated"]
+
+
 def test_rag_search_is_async_and_does_not_use_asyncio_run(monkeypatch):
     rag_module = importlib.import_module("project_advisor.tools.rag_search")
 
@@ -172,3 +185,42 @@ def test_rag_search_is_async_and_does_not_use_asyncio_run(monkeypatch):
 
     assert "RAG 搜索结果" in result
     assert "https://docs.example.com/langgraph" in result
+
+
+def test_rag_search_keeps_original_chinese_query_and_uses_fused_merge_score(monkeypatch):
+    rag_module = importlib.import_module("project_advisor.tools.rag_search")
+    searched = []
+
+    class FakePipeline:
+        def search(self, *, query, project_name, top_k):
+            searched.append(query)
+            if query == "中文权限过滤":
+                return [{"id": "exact", "text": "中文权限过滤配置", "hybrid_score": 0.9,
+                         "metadata": {"project_name": project_name}}]
+            return [{"id": "rewritten", "text": "generic access control", "hybrid_score": 0.4,
+                     "metadata": {"project_name": project_name}}]
+
+    class TranslatingRewriter:
+        async def generate_multi_queries(self, query):
+            return ["English access control"]
+
+        async def rewrite(self, query):
+            return "translated permissions"
+
+    class PassThroughReranker:
+        async def rerank(self, query, documents, top_k):
+            return documents[:top_k]
+
+    monkeypatch.setattr(rag_module, "_sync_from_store",
+                        lambda project_name, **kwargs: [{"project_name": project_name}])
+    monkeypatch.setattr(rag_module, "_get_pipeline", lambda config=None: FakePipeline())
+    monkeypatch.setattr(rag_module, "_get_rewriter", lambda config: TranslatingRewriter())
+    monkeypatch.setattr(rag_module, "_get_reranker", lambda config: PassThroughReranker())
+
+    result = asyncio.run(rag_module.rag_search.ainvoke({
+        "query": "中文权限过滤", "project_name": "示例项目", "top_k": 2,
+    }))
+
+    assert searched[0] == "中文权限过滤"
+    assert "中文权限过滤配置" in result
+    assert result.index("中文权限过滤配置") < result.index("generic access control")

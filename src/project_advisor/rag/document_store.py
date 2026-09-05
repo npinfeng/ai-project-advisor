@@ -174,6 +174,11 @@ class DocumentStore:
 
         return [Evidence.model_validate(d) for d in docs]
 
+    def get_by_ids(self, evidence_ids: set[str]) -> list[Evidence]:
+        """Return original records without changing their provenance on retrieval."""
+        return [Evidence.model_validate(doc) for docs in self._index.values() for doc in docs
+                if doc.get("evidence_id") in evidence_ids]
+
     def get_current_by_project(
         self,
         project_name: str,

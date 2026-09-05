@@ -21,6 +21,7 @@ from project_advisor.rag.embedder import Embedder
 from project_advisor.rag.ingestion import IngestionPipeline
 from project_advisor.rag.query_rewriter import QueryRewriter
 from project_advisor.rag.reranker import Reranker
+from project_advisor.tools.source_result import source_tool, sourced
 
 # 全局单例
 _pipeline: Optional[IngestionPipeline] = None
@@ -123,7 +124,7 @@ def _sync_from_store(
     return sync_results
 
 
-@tool(description=(
+@source_tool(description=(
     "Search the local knowledge base for technical documentation. Use this for "
     "precise queries about capabilities, APIs, or architecture of candidates."
 ))
@@ -170,37 +171,69 @@ async def rag_search(
 
     # 生成多角度子查询
     proj = sync_results[0]["project_name"] if project_name else None
-    sub_queries = await rewriter.generate_multi_queries(query)
-    if len(sub_queries) <= 1:
-        sub_queries = [await rewriter.rewrite(query)]
+    generated_queries = await rewriter.generate_multi_queries(query)
+    if len(generated_queries) <= 1:
+        generated_queries.append(await rewriter.rewrite(query))
+    # The original wording is always searched. This matters for Chinese proper
+    # nouns and exact phrases that an LLM rewrite may translate or paraphrase.
+    sub_queries = []
+    seen_queries = set()
+    for value in [query, *generated_queries]:
+        normalized = " ".join(str(value).split()).casefold()
+        if normalized and normalized not in seen_queries:
+            seen_queries.add(normalized)
+            sub_queries.append(str(value).strip())
+        if len(sub_queries) >= 6:
+            break
 
     # 用每个子查询并行搜索，按 chunk_id 去重合并
-    seen_ids: set[str] = set()
-    merged: list[dict] = []
-    for sq in sub_queries:
+    merged_by_id: dict[str, dict] = {}
+    for query_index, sq in enumerate(sub_queries):
         batch = await asyncio.to_thread(
             pipeline.search,
             query=sq,
             project_name=proj,
             top_k=max(top_k, 3),
         )
-        for item in batch:
+        for rank, item in enumerate(batch, start=1):
             chunk_id = item.get("id", "")
-            if chunk_id and chunk_id not in seen_ids:
-                seen_ids.add(chunk_id)
-                # 出现在更多子查询中的结果得分加权
-                item["multi_query_hits"] = item.get("multi_query_hits", 0) + 1
-                merged.append(item)
-            elif chunk_id in seen_ids:
-                # 已在结果中，增加多查询命中计数
-                for existing in merged:
-                    if existing.get("id") == chunk_id:
-                        existing["multi_query_hits"] = existing.get("multi_query_hits", 1) + 1
-                        existing["score"] = max(existing.get("score", 0), item.get("score", 0))
-                        break
+            if not chunk_id:
+                continue
+            retrieval_score = float(item.get(
+                "hybrid_score", item.get("rrf_score", item.get("score", 0))
+            ))
+            if chunk_id not in merged_by_id:
+                merged_by_id[chunk_id] = {
+                    **item,
+                    "multi_query_hits": 0,
+                    "multi_query_score_sum": 0.0,
+                    "multi_query_best_score": 0.0,
+                    "multi_query_rank_score": 0.0,
+                    "original_query_hit": False,
+                }
+            existing = merged_by_id[chunk_id]
+            existing["multi_query_hits"] += 1
+            existing["multi_query_score_sum"] += retrieval_score
+            existing["multi_query_best_score"] = max(existing["multi_query_best_score"], retrieval_score)
+            existing["multi_query_rank_score"] += 1.0 / (60 + rank)
+            existing["original_query_hit"] = existing["original_query_hit"] or query_index == 0
 
-    # 按多查询命中数 + 原始分数排序
-    merged.sort(key=lambda x: (x.get("multi_query_hits", 1), x.get("score", 0)), reverse=True)
+    merged = list(merged_by_id.values())
+    query_count = max(1, len(sub_queries))
+    for item in merged:
+        average_score = item["multi_query_score_sum"] / item["multi_query_hits"]
+        coverage = item["multi_query_hits"] / query_count
+        item["multi_query_score"] = (
+            0.60 * item["multi_query_best_score"]
+            + 0.25 * average_score
+            + 0.15 * coverage
+        )
+    merged.sort(key=lambda item: (
+        -item["multi_query_score"],
+        -int(item["original_query_hit"]),
+        -item["multi_query_rank_score"],
+        str(item["id"]),
+    ))
 
     if not merged:
         return f"未在本地知识库中找到与 '{query}' 相关的结果。知识库可能尚未索引相关文档。"
@@ -244,7 +277,10 @@ async def rag_search(
             f"- 内容：{text}\n"
         )
 
-    return "\n".join(lines)
+    from project_advisor.rag.document_store import DocumentStore
+    evidence_ids = {item.get("metadata", {}).get("evidence_id", "") for item in reranked} - {""}
+    originals = await asyncio.to_thread(lambda: DocumentStore().get_by_ids(evidence_ids)) if evidence_ids else []
+    return sourced("\n".join(lines), reused_evidences=originals)
 
 
 @tool(description=(

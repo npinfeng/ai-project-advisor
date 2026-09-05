@@ -5,7 +5,7 @@
 
 import hashlib
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -162,19 +162,50 @@ class Evidence(BaseModel):
     version_info: Optional[str] = Field(
         default=None, description="Document or software version at time of retrieval."
     )
+    evidence_kind: Literal["primary", "search_snippet", "discovery", "inference", "unverified"] = "unverified"
+    content_hash: str = ""
+    locator: str = Field(default="", description="File path, section or page within the source.")
+    truncated: bool = False
 
     @model_validator(mode="after")
     def populate_evidence_id(self) -> "Evidence":
         """Generate a deterministic ID while preserving explicitly supplied IDs."""
+        self.content_hash = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
         if not self.evidence_id:
             payload = "\x1f".join(
-                [self.source_url, self.project_name, self.relevance, self.content]
+                [self.source_url, self.project_name, self.version_info or "", self.content]
             )
             self.evidence_id = f"ev_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]}"
         return self
 
 
 # ===== 评估模型 =====
+
+class EvidenceCitation(BaseModel):
+    evidence_id: str
+    quote: str = Field(min_length=8, max_length=2000, description="Exact supporting passage copied from source content.")
+    source_url: str = ""
+    start_char: Optional[int] = None
+    end_char: Optional[int] = None
+
+
+class RequirementVerdict(BaseModel):
+    project_name: str
+    requirement: str
+    status: Literal["built_in", "integration", "unsupported", "unknown", "conflicting"] = "unknown"
+    applicable_version: str = ""
+    reason: str = ""
+    citations: list[EvidenceCitation] = Field(default_factory=list, max_length=8)
+
+
+class RequirementAssessment(BaseModel):
+    verdicts: list[RequirementVerdict] = Field(default_factory=list)
+
+
+class DimensionRationale(BaseModel):
+    dimension: Literal["feature_match", "engineering_reliability", "community_and_maintenance", "documentation_quality", "learning_cost", "extensibility", "deployment_cost"]
+    reason: str
+    citations: list[EvidenceCitation] = Field(default_factory=list, max_length=8)
 
 class EvaluationCriteria(BaseModel):
     """评估维度和权重配置。"""
@@ -239,6 +270,9 @@ class ProjectScore(BaseModel):
         default="low",
         description="Evidence confidence: high, medium, low, or insufficient.",
     )
+    dimension_rationales: list[DimensionRationale] = Field(default_factory=list)
+    requirement_verdicts: list[RequirementVerdict] = Field(default_factory=list)
+    eligibility: Literal["eligible", "conditional", "excluded"] = "conditional"
 
 
 class ReviewResult(BaseModel):

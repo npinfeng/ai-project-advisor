@@ -165,6 +165,7 @@ NODE_LABELS = {
     "confirm_plan": "确认候选项目",
     "feasibility_check": "约束可行性预检",
     "parallel_research": "专业化并行研究",
+    "verify_requirements": "逐项硬约束核验",
     "evidence_coverage": "确定性证据检查",
     "supplemental_research": "受限补充研究",
     "review_and_score": "证据审查与评分",

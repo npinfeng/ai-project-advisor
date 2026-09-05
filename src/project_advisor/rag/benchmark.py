@@ -15,7 +15,7 @@ import json
 import math
 import os
 import platform
-import re
+import random
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +29,7 @@ from project_advisor.rag.bm25_retriever import BM25Retriever
 from project_advisor.rag.chunker import DocumentChunker
 from project_advisor.rag.embedder import Embedder
 from project_advisor.rag.hybrid_retriever import HybridRetriever, score_rank_fusion
+from project_advisor.rag.text_analysis import lexical_tokens
 from project_advisor.rag.vector_store import VectorStore
 
 
@@ -52,7 +53,7 @@ class HashEmbedder:
 
     @staticmethod
     def _tokens(text: str) -> list[str]:
-        return re.findall(r"[\w.-]+", text.casefold(), flags=re.UNICODE)
+        return lexical_tokens(text)
 
     def embed(self, text: str) -> list[float]:
         vector = [0.0] * self.dimensions
@@ -96,6 +97,51 @@ class BenchmarkQuery:
     relevant_document_ids: tuple[str, ...]
     project_name: str | None = None
     rewritten_queries: tuple[str, ...] = ()
+    relevance_grades: tuple[tuple[str, int], ...] = ()
+    language: str = "unknown"
+    category: str = "general"
+
+    @property
+    def relevance_by_document(self) -> dict[str, int]:
+        if self.relevance_grades:
+            return dict(self.relevance_grades)
+        return {document_id: 1 for document_id in self.relevant_document_ids}
+
+
+@dataclass(frozen=True)
+class BenchmarkDatasetMetadata:
+    name: str
+    kind: str
+    annotation_status: str
+    annotation_method: str
+    annotator: str
+    reviewed_at: str
+    snapshot_at: str
+    fingerprint: str
+    query_source: str = ""
+    corpus_version: str = ""
+    privacy_status: str = ""
+    guideline_version: str = ""
+    dataset_author: str = ""
+    source_path: str = ""
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "annotation_status": self.annotation_status,
+            "annotation_method": self.annotation_method,
+            "annotator": self.annotator,
+            "reviewed_at": self.reviewed_at,
+            "snapshot_at": self.snapshot_at,
+            "fingerprint": self.fingerprint,
+            "query_source": self.query_source,
+            "corpus_version": self.corpus_version,
+            "privacy_status": self.privacy_status,
+            "guideline_version": self.guideline_version,
+            "dataset_author": self.dataset_author,
+            "source_path": self.source_path,
+        }
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -108,6 +154,18 @@ def _percentile(values: list[float], percentile: float) -> float:
     if lower == upper:
         return ordered[lower]
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _bootstrap_mean_interval(values: list[float], samples: int = 1000) -> dict[str, float]:
+    """Deterministic 95% bootstrap interval for a query-level mean."""
+    if not values:
+        return {"lower": 0.0, "upper": 0.0}
+    generator = random.Random(20260905)
+    means = [
+        mean(generator.choice(values) for _ in values)
+        for _ in range(samples)
+    ]
+    return {"lower": _percentile(means, 0.025), "upper": _percentile(means, 0.975)}
 
 
 def _round_floats(value: Any) -> Any:
@@ -189,9 +247,29 @@ def generate_synthetic_dataset(
     return documents, queries
 
 
-def load_dataset(path: Path) -> tuple[list[BenchmarkDocument], list[BenchmarkQuery]]:
-    """Load an independently labelled benchmark dataset from JSON."""
+def load_dataset_with_metadata(
+    path: Path,
+) -> tuple[list[BenchmarkDocument], list[BenchmarkQuery], BenchmarkDatasetMetadata]:
+    """Load documents, graded qrels, and provenance for a benchmark snapshot."""
     payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_metadata = payload.get("metadata") or {}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    metadata = BenchmarkDatasetMetadata(
+        name=str(raw_metadata.get("name") or path.stem),
+        kind=str(raw_metadata.get("kind") or "labelled"),
+        annotation_status=str(raw_metadata.get("annotation_status") or "unreviewed"),
+        annotation_method=str(raw_metadata.get("annotation_method") or ""),
+        annotator=str(raw_metadata.get("annotator") or ""),
+        reviewed_at=str(raw_metadata.get("reviewed_at") or ""),
+        snapshot_at=str(raw_metadata.get("snapshot_at") or ""),
+        fingerprint=f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}",
+        query_source=str(raw_metadata.get("query_source") or ""),
+        corpus_version=str(raw_metadata.get("corpus_version") or ""),
+        privacy_status=str(raw_metadata.get("privacy_status") or ""),
+        guideline_version=str(raw_metadata.get("guideline_version") or ""),
+        dataset_author=str(raw_metadata.get("dataset_author") or ""),
+        source_path=str(path),
+    )
     documents = [
         BenchmarkDocument(
             document_id=str(item["id"]),
@@ -202,35 +280,84 @@ def load_dataset(path: Path) -> tuple[list[BenchmarkDocument], list[BenchmarkQue
         )
         for item in payload.get("documents", [])
     ]
-    queries = [
-        BenchmarkQuery(
+    queries = []
+    for item in payload.get("queries", []):
+        qrels = item.get("qrels") or []
+        grades = []
+        seen_qrels = set()
+        for judgment in qrels:
+            document_id = str(judgment["document_id"])
+            raw_grade = judgment["relevance"]
+            if isinstance(raw_grade, bool) or not isinstance(raw_grade, int):
+                raise ValueError("qrel relevance must be an integer from 0 to 3")
+            grade = raw_grade
+            if document_id in seen_qrels:
+                raise ValueError(f"duplicate qrel for query {item['id']}: {document_id}")
+            if grade < 0 or grade > 3:
+                raise ValueError("qrel relevance must be an integer from 0 to 3")
+            seen_qrels.add(document_id)
+            grades.append((document_id, grade))
+        relevant_ids = tuple(
+            document_id for document_id, grade in grades if grade > 0
+        ) or tuple(str(value) for value in item.get("relevant_document_ids", []))
+        queries.append(BenchmarkQuery(
             query_id=str(item["id"]),
             query=str(item["query"]),
-            relevant_document_ids=tuple(
-                str(value) for value in item.get("relevant_document_ids", [])
-            ),
+            relevant_document_ids=relevant_ids,
             project_name=(
                 str(item["project_name"]) if item.get("project_name") else None
             ),
             rewritten_queries=tuple(
                 str(value) for value in item.get("rewritten_queries", [])
             ),
-        )
-        for item in payload.get("queries", [])
-    ]
+            relevance_grades=tuple(grades),
+            language=str(item.get("language") or "unknown"),
+            category=str(item.get("category") or "general"),
+        ))
     if not documents or not queries:
         raise ValueError("benchmark dataset requires non-empty documents and queries")
+    if any(not item.document_id.strip() or not item.content.strip() for item in documents):
+        raise ValueError("benchmark documents require non-empty IDs and content")
+    if any(not item.query_id.strip() or not item.query.strip() for item in queries):
+        raise ValueError("benchmark queries require non-empty IDs and query text")
+    if len({item.document_id for item in documents}) != len(documents):
+        raise ValueError("benchmark document IDs must be unique")
+    if len({item.query_id for item in queries}) != len(queries):
+        raise ValueError("benchmark query IDs must be unique")
     document_ids = {item.document_id for item in documents}
     unknown = {
         relevant
         for query in queries
-        for relevant in query.relevant_document_ids
+        for relevant in query.relevance_by_document
         if relevant not in document_ids
     }
     if unknown:
         raise ValueError(f"queries reference unknown document IDs: {sorted(unknown)[:5]}")
+    document_projects = {item.document_id: item.project_name for item in documents}
+    unreachable = {
+        (query.query_id, document_id)
+        for query in queries if query.project_name
+        for document_id, grade in query.relevance_by_document.items()
+        if grade > 0 and document_projects.get(document_id) != query.project_name
+    }
+    if unreachable:
+        raise ValueError(
+            "project-filtered queries reference documents outside their project: "
+            f"{sorted(unreachable)[:5]}"
+        )
     if any(not query.relevant_document_ids for query in queries):
         raise ValueError("every benchmark query requires at least one relevant document ID")
+    if metadata.kind == "real" and any(
+        not document.source_url.startswith(("https://", "http://"))
+        for document in documents
+    ):
+        raise ValueError("real benchmark documents require HTTP(S) source URLs")
+    return documents, queries, metadata
+
+
+def load_dataset(path: Path) -> tuple[list[BenchmarkDocument], list[BenchmarkQuery]]:
+    """Backward-compatible dataset loader without metadata in the return value."""
+    documents, queries, _ = load_dataset_with_metadata(path)
     return documents, queries
 
 
@@ -247,8 +374,10 @@ def evaluate_retrieval(
     precisions: list[float] = []
     reciprocal_ranks: list[float] = []
     ndcgs: list[float] = []
+    average_precisions: list[float] = []
     latencies: list[float] = []
     errors: list[str] = []
+    query_details: list[dict[str, Any]] = []
 
     for query, results, latency_ms, error in query_results:
         latencies.append(latency_ms)
@@ -258,23 +387,86 @@ def evaluate_retrieval(
             precisions.append(0.0)
             reciprocal_ranks.append(0.0)
             ndcgs.append(0.0)
+            average_precisions.append(0.0)
+            query_details.append({
+                "query_id": query.query_id, "language": query.language,
+                "category": query.category, "recall_at_k": 0.0,
+                "reciprocal_rank": 0.0, "ndcg_at_k": 0.0,
+                "average_precision_at_k": 0.0, "retrieved_document_ids": [],
+                "error": error,
+            })
             continue
-        relevant = set(query.relevant_document_ids)
-        retrieved = [_result_document_id(item) for item in results[:top_k]]
+        judgments = query.relevance_by_document
+        relevant = {document_id for document_id, grade in judgments.items() if grade > 0}
+        # One source document may produce several chunks. Document-level qrels
+        # count only its highest-ranked chunk and never award duplicate gain.
+        retrieved = []
+        seen_document_ids = set()
+        for item in results:
+            document_id = _result_document_id(item)
+            if not document_id or document_id in seen_document_ids:
+                continue
+            seen_document_ids.add(document_id)
+            retrieved.append(document_id)
+            if len(retrieved) >= top_k:
+                break
         hits = [document_id in relevant for document_id in retrieved]
         hit_count = len(set(retrieved) & relevant)
-        recalls.append(hit_count / len(relevant))
-        precisions.append(hit_count / top_k)
+        recall = hit_count / len(relevant)
+        precision = hit_count / top_k
+        recalls.append(recall)
+        precisions.append(precision)
         first_hit = next((rank for rank, hit in enumerate(hits, 1) if hit), None)
-        reciprocal_ranks.append(1.0 / first_hit if first_hit else 0.0)
+        reciprocal_rank = 1.0 / first_hit if first_hit else 0.0
+        reciprocal_ranks.append(reciprocal_rank)
+        running_hits = 0
+        precision_sum = 0.0
+        seen_relevant = set()
+        for rank, document_id in enumerate(retrieved, 1):
+            if document_id in relevant and document_id not in seen_relevant:
+                seen_relevant.add(document_id)
+                running_hits += 1
+                precision_sum += running_hits / rank
+        average_precision = precision_sum / len(relevant)
+        average_precisions.append(average_precision)
         dcg = sum(
-            1.0 / math.log2(rank + 1)
-            for rank, hit in enumerate(hits, 1)
-            if hit
+            (math.pow(2, judgments.get(document_id, 0)) - 1) / math.log2(rank + 1)
+            for rank, document_id in enumerate(retrieved, 1)
+            if judgments.get(document_id, 0) > 0
         )
-        ideal_hits = min(len(relevant), top_k)
-        ideal_dcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_hits + 1))
-        ndcgs.append(dcg / ideal_dcg if ideal_dcg else 0.0)
+        ideal_grades = sorted((grade for grade in judgments.values() if grade > 0), reverse=True)[:top_k]
+        ideal_dcg = sum(
+            (math.pow(2, grade) - 1) / math.log2(rank + 1)
+            for rank, grade in enumerate(ideal_grades, 1)
+        )
+        ndcg = dcg / ideal_dcg if ideal_dcg else 0.0
+        ndcgs.append(ndcg)
+        query_details.append({
+            "query_id": query.query_id,
+            "language": query.language,
+            "category": query.category,
+            "recall_at_k": recall,
+            "reciprocal_rank": reciprocal_rank,
+            "ndcg_at_k": ndcg,
+            "average_precision_at_k": average_precision,
+            "retrieved_document_ids": retrieved,
+            "relevant_document_ids": sorted(relevant),
+            "error": None,
+        })
+
+    slices: dict[str, dict[str, Any]] = {}
+    for field in ("language", "category"):
+        values = sorted({str(item[field]) for item in query_details})
+        slices[field] = {}
+        for value in values:
+            selected = [item for item in query_details if str(item[field]) == value]
+            slices[field][value] = {
+                "query_count": len(selected),
+                "recall_at_k": mean(item["recall_at_k"] for item in selected),
+                "mrr": mean(item["reciprocal_rank"] for item in selected),
+                "ndcg_at_k": mean(item["ndcg_at_k"] for item in selected),
+                "map_at_k": mean(item["average_precision_at_k"] for item in selected),
+            }
 
     return {
         "query_count": len(query_results),
@@ -283,6 +475,7 @@ def evaluate_retrieval(
         "precision_at_k": mean(precisions),
         "mrr": mean(reciprocal_ranks),
         "ndcg_at_k": mean(ndcgs),
+        "map_at_k": mean(average_precisions),
         "hit_rate_at_k": mean(value > 0 for value in recalls),
         "error_count": len(errors),
         "error_rate": len(errors) / len(query_results) if query_results else 0.0,
@@ -294,6 +487,17 @@ def evaluate_retrieval(
             "max": max(latencies, default=0.0),
         },
         "errors": errors[:10],
+        "missed_query_ids": [
+            item["query_id"] for item in query_details if item["recall_at_k"] == 0
+        ],
+        "slices": slices,
+        "queries": query_details,
+        "confidence_intervals_95": {
+            "recall_at_k": _bootstrap_mean_interval(recalls),
+            "mrr": _bootstrap_mean_interval(reciprocal_ranks),
+            "ndcg_at_k": _bootstrap_mean_interval(ndcgs),
+            "map_at_k": _bootstrap_mean_interval(average_precisions),
+        },
     }
 
 
@@ -377,6 +581,7 @@ def _quality_summary(metrics: dict[str, Any]) -> dict[str, Any]:
             "precision_at_k",
             "mrr",
             "ndcg_at_k",
+            "map_at_k",
             "hit_rate_at_k",
             "error_count",
             "error_rate",
@@ -586,7 +791,7 @@ def evaluate_gates(
     if scenario is None:
         raise ValueError(f"gate concurrency {gate_concurrency} was not benchmarked")
 
-    def add(metric: str, actual: float, expectation: str, passed: bool) -> None:
+    def add(metric: str, actual: Any, expectation: str, passed: bool) -> None:
         gates.append({
             "metric": metric,
             "actual": actual,
@@ -608,7 +813,33 @@ def evaluate_gates(
         scenario["error_rate"] <= max_error_rate,
     )
 
+    baseline_comparable = True
     if baseline is not None:
+        comparisons = (
+            ("dataset_fingerprint", report.get("dataset", {}).get("fingerprint"),
+             baseline.get("dataset", {}).get("fingerprint")),
+            ("top_k", report.get("configuration", {}).get("top_k"),
+             baseline.get("configuration", {}).get("top_k")),
+            ("embedder", report.get("configuration", {}).get("embedder"),
+             baseline.get("configuration", {}).get("embedder")),
+            ("retrieval_signature", report.get("configuration", {}).get("retrieval_signature"),
+             baseline.get("configuration", {}).get("retrieval_signature")),
+            ("environment_fingerprint", report.get("environment", {}).get("fingerprint"),
+             baseline.get("environment", {}).get("fingerprint")),
+        )
+        if "baseline_eligibility" in baseline:
+            publishable = bool(baseline["baseline_eligibility"].get("is_publishable"))
+            baseline_comparable = baseline_comparable and publishable
+            add("baseline.compatibility.publishable", publishable, "== True", publishable)
+        for name, current_value, baseline_value in comparisons:
+            if baseline_value is None:
+                continue  # Backward-compatible with schema-v2 reports.
+            matches = current_value == baseline_value
+            baseline_comparable = baseline_comparable and matches
+            add(f"baseline.compatibility.{name}", current_value,
+                f"== {baseline_value}", matches)
+
+    if baseline is not None and baseline_comparable:
         baseline_quality = baseline.get("quality", {})
         baseline_recall = float(baseline_quality.get("recall_at_k", 0.0))
         add(
@@ -646,6 +877,51 @@ def evaluate_gates(
     }
 
 
+def evaluate_baseline_eligibility(
+    report: dict[str, Any],
+    *,
+    minimum_queries: int = 20,
+) -> dict[str, Any]:
+    """Fail closed unless a report can serve as a real quality baseline."""
+    dataset = report.get("dataset", {})
+    configuration = report.get("configuration", {})
+    reasons = []
+    checks = [
+        (dataset.get("kind") == "real", "数据集 kind 必须为 real。"),
+        (dataset.get("annotation_status") == "reviewed", "相关性标注尚未审核。"),
+        (dataset.get("annotation_method") == "independent_human", "必须由独立人工标注。"),
+        (bool(dataset.get("annotator")), "缺少标注人。"),
+        (bool(dataset.get("reviewed_at")), "缺少标注审核时间。"),
+        (bool(dataset.get("snapshot_at")), "缺少语料快照时间。"),
+        (bool(dataset.get("query_source")), "缺少去标识化真实查询的来源说明。"),
+        (bool(dataset.get("corpus_version")), "缺少可复现的语料版本。"),
+        (dataset.get("privacy_status") == "reviewed", "真实查询尚未通过隐私审核。"),
+        (bool(dataset.get("guideline_version")), "缺少相关性标注规范版本。"),
+        (bool(dataset.get("dataset_author")), "缺少数据集整理人。"),
+        (bool(dataset.get("annotator")) and str(dataset.get("annotator")).casefold()
+         != str(dataset.get("dataset_author")).casefold(),
+         "标注审核人必须独立于数据集整理人。"),
+        (str(dataset.get("fingerprint", "")).startswith("sha256:"), "缺少数据集内容指纹。"),
+        (int(configuration.get("query_count", 0)) >= minimum_queries,
+         f"真实基线至少需要 {minimum_queries} 条查询。"),
+        (int(configuration.get("graded_query_count", 0)) == int(configuration.get("query_count", 0)),
+         "每条查询都必须使用 0-3 级 qrels。"),
+        (not str(configuration.get("embedder", "")).startswith("hash:"),
+         "Hash Embedding 只适用于 CI，不能发布为真实质量基线。"),
+        (report.get("quality_gates", {}).get("min_recall_at_k") is not None,
+         "必须显式设置最低 Recall@K。"),
+        (report.get("quality_gates", {}).get("min_mrr") is not None,
+         "必须显式设置最低 MRR。"),
+        (report.get("verdict", {}).get("status") == "pass", "质量或性能门禁未通过。"),
+    ]
+    reasons.extend(message for passed, message in checks if not passed)
+    return {
+        "is_publishable": not reasons,
+        "minimum_queries": minimum_queries,
+        "reasons": reasons,
+    }
+
+
 def run_benchmark(
     *,
     documents: list[BenchmarkDocument],
@@ -675,11 +951,16 @@ def run_benchmark(
     max_p95_regression_pct: float = 20.0,
     max_qps_drop_pct: float = 20.0,
     max_recall_drop: float = 0.02,
+    dataset_metadata: BenchmarkDatasetMetadata | None = None,
+    minimum_baseline_queries: int = 20,
 ) -> dict[str, Any]:
     if not concurrency_levels or any(value < 1 for value in concurrency_levels):
         raise ValueError("concurrency levels must be positive")
-    if top_k < 1 or repetitions < 1 or warmup < 0:
-        raise ValueError("top-k/repetitions must be positive and warmup non-negative")
+    if top_k < 1 or repetitions < 1 or minimum_baseline_queries < 1 or warmup < 0:
+        raise ValueError(
+            "top-k/repetitions/minimum baseline queries must be positive "
+            "and warmup non-negative"
+        )
 
     vector_dir = storage_dir / "vector"
     bm25_dir = storage_dir / "bm25"
@@ -751,33 +1032,70 @@ def run_benchmark(
                 "Hash embeddings exclude production-model inference cost and semantic quality."
             )
 
+        if dataset_metadata is None:
+            snapshot = {
+                "documents": [document.__dict__ for document in documents],
+                "queries": [query.__dict__ for query in queries],
+            }
+            fingerprint = "sha256:" + hashlib.sha256(
+                json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=list).encode("utf-8")
+            ).hexdigest()
+            dataset_metadata = BenchmarkDatasetMetadata(
+                name=f"{dataset_kind}-runtime-dataset", kind=dataset_kind,
+                annotation_status="unreviewed", annotation_method="",
+                annotator="", reviewed_at="", snapshot_at="", fingerprint=fingerprint,
+            )
+        environment = {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "processor": platform.processor(),
+            "logical_cpu_count": os.cpu_count(),
+        }
+        environment["fingerprint"] = "sha256:" + hashlib.sha256(
+            json.dumps(environment, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        configuration = {
+            "dataset_kind": dataset_kind,
+            "document_count": len(documents),
+            "query_count": len(queries),
+            "graded_query_count": sum(bool(query.relevance_grades) for query in queries),
+            "project_count": len(grouped),
+            "embedder": embedder_name,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "top_k": top_k,
+            "concurrency_levels": concurrency_levels,
+            "repetitions": repetitions,
+            "warmup_queries": min(warmup, len(queries)),
+            "vector_weight": retriever.vector_weight,
+            "bm25_weight": retriever.bm25_weight,
+            "rank_weight": retriever.rank_weight,
+            "score_weight": retriever.score_weight,
+            "candidate_pool_factor": retriever.candidate_pool_factor,
+            "min_results_per_source": retriever.min_results_per_source,
+        }
+        retrieval_configuration = {
+            key: configuration[key]
+            for key in (
+                "embedder", "chunk_size", "chunk_overlap", "top_k",
+                "vector_weight", "bm25_weight", "rank_weight", "score_weight",
+                "candidate_pool_factor", "min_results_per_source",
+            )
+        }
+        configuration["retrieval_signature"] = "sha256:" + hashlib.sha256(
+            json.dumps(retrieval_configuration, sort_keys=True).encode("utf-8")
+        ).hexdigest()
         report: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "environment": {
-                "python": platform.python_version(),
-                "platform": platform.platform(),
-                "processor": platform.processor(),
-                "logical_cpu_count": os.cpu_count(),
-            },
-            "configuration": {
-                "dataset_kind": dataset_kind,
-                "document_count": len(documents),
-                "query_count": len(queries),
-                "project_count": len(grouped),
-                "embedder": embedder_name,
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "top_k": top_k,
-                "concurrency_levels": concurrency_levels,
-                "repetitions": repetitions,
-                "warmup_queries": min(warmup, len(queries)),
-                "vector_weight": retriever.vector_weight,
-                "bm25_weight": retriever.bm25_weight,
-                "rank_weight": retriever.rank_weight,
-                "score_weight": retriever.score_weight,
-                "candidate_pool_factor": retriever.candidate_pool_factor,
-                "min_results_per_source": retriever.min_results_per_source,
+            "dataset": dataset_metadata.as_dict(),
+            "environment": environment,
+            "configuration": configuration,
+            "quality_gates": {
+                "min_recall_at_k": min_recall_at_k,
+                "min_mrr": min_mrr,
+                "max_p95_ms": max_p95_ms,
+                "max_error_rate": max_error_rate,
             },
             "indexing": {
                 "chunk_count": chunk_count,
@@ -815,6 +1133,9 @@ def run_benchmark(
             max_p95_regression_pct=max_p95_regression_pct,
             max_qps_drop_pct=max_qps_drop_pct,
             max_recall_drop=max_recall_drop,
+        )
+        report["baseline_eligibility"] = evaluate_baseline_eligibility(
+            report, minimum_queries=minimum_baseline_queries
         )
         return _round_floats(report)
     finally:
@@ -872,15 +1193,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-p95-regression-pct", type=float, default=20.0)
     parser.add_argument("--max-qps-drop-pct", type=float, default=20.0)
     parser.add_argument("--max-recall-drop", type=float, default=0.02)
+    parser.add_argument("--minimum-baseline-queries", type=int, default=20)
+    parser.add_argument(
+        "--require-publishable-baseline",
+        action="store_true",
+        help="Exit with status 3 unless real reviewed qrels and a production embedder were used",
+    )
     parser.add_argument("--fail-on-gate", action="store_true", help="Exit with status 2 when any gate fails")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    dataset_metadata = None
     if args.dataset:
-        documents, queries = load_dataset(args.dataset)
-        dataset_kind = "labelled"
+        documents, queries, dataset_metadata = load_dataset_with_metadata(args.dataset)
+        dataset_kind = dataset_metadata.kind
     else:
         documents, queries = generate_synthetic_dataset(
             args.documents, args.queries, args.projects
@@ -947,6 +1275,8 @@ def main() -> None:
             max_p95_regression_pct=args.max_p95_regression_pct,
             max_qps_drop_pct=args.max_qps_drop_pct,
             max_recall_drop=args.max_recall_drop,
+            dataset_metadata=dataset_metadata,
+            minimum_baseline_queries=args.minimum_baseline_queries,
         )
         output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
         if args.output:
@@ -955,6 +1285,8 @@ def main() -> None:
         print(output, end="")
         if args.fail_on_gate and report["verdict"]["status"] == "fail":
             raise SystemExit(2)
+        if args.require_publishable_baseline and not report["baseline_eligibility"]["is_publishable"]:
+            raise SystemExit(3)
     finally:
         if temporary is not None:
             temporary.cleanup()

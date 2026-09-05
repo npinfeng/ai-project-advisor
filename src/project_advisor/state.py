@@ -14,6 +14,7 @@ from project_advisor.schemas.evidence import (
     Evidence,
     ProjectScore,
     Requirements,
+    RequirementVerdict,
 )
 
 
@@ -116,6 +117,7 @@ class AgentState(MessagesState):
     research_round: int = 0
     supplemental_round_used: bool = False
     evidence_gaps: list[EvidenceGap] = []
+    requirement_verdicts: list[RequirementVerdict] = []
     token_usage: Annotated[dict, token_usage_reducer] = {}
     raw_notes: Annotated[list[str], override_reducer] = []
     evidences: Annotated[list, operator.add] = []

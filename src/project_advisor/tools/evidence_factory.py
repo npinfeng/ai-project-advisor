@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 from project_advisor.schemas.evidence import Evidence
 
 
-URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
 ERROR_PREFIXES = (
     "工具执行出错",
     "无法抓取网页",
@@ -28,6 +27,10 @@ ERROR_PREFIXES = (
     "本地知识库中还没有",
     "未在本地知识库中找到",
     "未找到有效搜索结果",
+    "未能成功抓取",
+    "未提供 url",
+    "duckduckgo 未找到结果",
+    "duckduckgo 搜索不可用",
 )
 SOURCE_DATE_PATTERN = re.compile(
     r"(?:内容日期|发布日期|最近更新|最近推送|source_date|published_at|updated_at)"
@@ -117,12 +120,31 @@ def build_evidences_from_tool_result(
     result: Any,
     project_name: str,
     research_topic: str,
+    artifact: Any = None,
 ) -> list[Evidence]:
     """Normalize a tool observation into one Evidence object per source URL."""
     args = args or {}
     content = _serialize_result(result).strip()
     if not content or is_error_tool_result(result):
         return []
+
+    if artifact is not None:
+        from project_advisor.tools.source_result import SourceArtifact
+        bundle = SourceArtifact.model_validate(artifact)
+        resolved_project = project_name.strip() or str(args.get("project_name", "")).strip() or "未明确项目"
+        values = [
+            Evidence(
+                **document.model_dump(),
+                project_name=resolved_project,
+                relevance=research_topic.strip() or "候选项目技术评估",
+                confidence="medium",
+            )
+            for document in bundle.documents
+            if document.content.strip() and document.source_url.startswith(("https://", "http://"))
+        ]
+        # RAG is a read: carry original identity, source time and project unchanged.
+        values.extend(bundle.reused_evidences)
+        return list({value.evidence_id: value for value in values}.values())
 
     urls: list[str] = []
     for candidate in (
@@ -133,8 +155,10 @@ def build_evidences_from_tool_result(
         if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
             urls.append(candidate)
     tool_name_lower = tool_name.casefold()
+    # Legacy multi-source strings have no trustworthy passage-to-URL mapping.
+    # Keep them as an unverified internal observation, never fan out its content.
     if any(token in tool_name_lower for token in ("search", "batch", "rag", "mcp")):
-        urls.extend(URL_PATTERN.findall(content))
+        urls = []
 
     unique_urls: list[str] = []
     for url in urls:
@@ -167,6 +191,7 @@ def build_evidences_from_tool_result(
                 confidence=confidence,
                 retrieved_at=retrieved_at,
                 source_date=source_date,
+                evidence_kind="unverified",
             )
         )
     return evidences

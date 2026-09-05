@@ -30,6 +30,7 @@ from project_advisor.agents.repository_analyst import (
     repository_analyst,
 )
 from project_advisor.agents.reviewer import generate_report, review_and_score
+from project_advisor.agents.requirement_verifier import verify_requirements
 from project_advisor.configuration import Configuration
 from project_advisor.observability.logging import bind_log_context, log_event
 from project_advisor.rag.knowledge_store import persist_evidences
@@ -60,80 +61,6 @@ DOCUMENTATION_SOURCE_TYPES = {
     "mcp",
 }
 
-# Only decision-critical capabilities are checked at the coverage gate. General
-# scoring dimensions such as learning cost are useful comparison criteria, but
-# they should not trigger a long, noisy list of pseudo-blocking gaps.
-_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
-    "multi_agent": (
-        "multi_agent", "multi-agent", "multi agent", "multiagent",
-        "多智能体", "supervisor", "groupchat", "group chat",
-    ),
-    "rag": (
-        "rag", "retrieval augmented", "retrieval-augmented", "retriever",
-        "vector store", "vector database", "向量数据库", "检索增强",
-        "知识库",
-    ),
-    "human_in_the_loop": (
-        "human_in_the_loop", "human-in-the-loop", "human in the loop",
-        "hitl", "interrupt", "human approval", "人工审批", "人在回环",
-        "人机协同",
-    ),
-    "state_persistence": (
-        "state_persistence", "state persistence", "checkpoint",
-        "checkpointer", "durable execution", "persisted state", "持久化",
-        "中断恢复", "状态恢复",
-    ),
-    "self_hosted": (
-        "self_hosted", "self-hosted", "self hosted", "on-prem",
-        "on premises", "private network", "私有化部署", "本地部署",
-        "内网部署",
-    ),
-    "mcp": ("mcp", "model context protocol"),
-}
-
-
-def _canonical_capability(value: str) -> str | None:
-    """Map common requirement spellings to a capability coverage key."""
-    normalized = " ".join(value.casefold().replace("-", "_").split())
-    direct = {
-        "multi_agent": "multi_agent",
-        "多agent": "multi_agent",
-        "多智能体": "multi_agent",
-        "rag": "rag",
-        "知识库": "rag",
-        "human_in_the_loop": "human_in_the_loop",
-        "hitl": "human_in_the_loop",
-        "人工审批": "human_in_the_loop",
-        "人在回环": "human_in_the_loop",
-        "state_persistence": "state_persistence",
-        "checkpoint": "state_persistence",
-        "持久化": "state_persistence",
-        "self_hosted": "self_hosted",
-        "私有化部署": "self_hosted",
-        "mcp": "mcp",
-    }
-    return direct.get(normalized)
-
-
-def _missing_capability_evidence(
-    project_evidence: list[Evidence],
-    required_capabilities: list[str],
-) -> list[str]:
-    """Return required capabilities not directly mentioned in evidence content."""
-    searchable = "\n".join(
-        f"{item.source_url}\n{item.content}" for item in project_evidence
-    ).casefold()
-    missing: list[str] = []
-    for requirement in required_capabilities:
-        capability = _canonical_capability(requirement)
-        if capability is None or capability in missing:
-            continue
-        aliases = _CAPABILITY_ALIASES[capability]
-        if not any(alias in searchable for alias in aliases):
-            missing.append(capability)
-    return missing
-
-
 def _normalize_evidences(values: list[Any]) -> list[Evidence]:
     normalized: list[Evidence] = []
     seen: set[str] = set()
@@ -162,7 +89,6 @@ def _evidence_for_project(
         evidence
         for evidence in evidences
         if target == evidence.project_name.casefold().strip()
-        or target in evidence.project_name.casefold()
     ]
 
 
@@ -171,6 +97,7 @@ def detect_evidence_gaps(
     evidences: list[Any],
     github_url_map: dict[str, str | None] | None = None,
     required_capabilities: list[str] | None = None,
+    requirement_verdicts: list | None = None,
 ) -> list[EvidenceGap]:
     """Build a deterministic candidate-by-track evidence coverage matrix.
 
@@ -197,16 +124,16 @@ def detect_evidence_gaps(
                 reason="缺少官方文档、Web 搜索或只读 RAG 的结构化证据。",
             ))
         elif required_capabilities:
-            missing = _missing_capability_evidence(
-                project_evidence,
-                required_capabilities,
-            )
+            from project_advisor.agents.requirement_verifier import validate_verdicts
+            verified = validate_verdicts(candidate, required_capabilities,
+                                        requirement_verdicts or [], project_evidence)
+            missing = [v.requirement for v in verified if v.status in {"unknown", "conflicting"}]
             if missing:
                 gaps.append(EvidenceGap(
                     project_name=candidate,
                     track="documentation",
                     reason=(
-                        "缺少以下硬约束的直接文档证据："
+                        "以下硬约束尚未证实或来源冲突："
                         f"{'、'.join(missing)}。证据不足不代表框架不支持；"
                         "需要定向补充官方能力或集成文档。"
                     ),
@@ -342,26 +269,14 @@ def evidence_coverage(state: AgentState) -> dict[str, Any]:
         for rec in state.get("candidate_recommendations", [])
         if hasattr(rec, "name")
     }
-    requirements = state.get("requirements")
-    if hasattr(requirements, "model_dump"):
-        requirements = requirements.model_dump()
-    required_capabilities = (
-        list(requirements.get("required_features", []) or [])
-        if isinstance(requirements, dict)
-        else []
-    )
-    deployment = (
-        str(requirements.get("deployment") or "")
-        if isinstance(requirements, dict)
-        else ""
-    )
-    if deployment:
-        required_capabilities.append(deployment)
+    from project_advisor.agents.requirement_verifier import required_items
+    required_capabilities = required_items(state.get("requirements"))
     gaps = detect_evidence_gaps(
         candidates,
         state.get("evidences", []),
         github_url_map,
         required_capabilities,
+        state.get("requirement_verdicts", []),
     )
     if not gaps or state.get("supplemental_round_used", False):
         return {
@@ -630,6 +545,7 @@ deep_researcher_builder.add_node("plan_evaluation", plan_evaluation)
 deep_researcher_builder.add_node("confirm_plan", confirm_plan)
 deep_researcher_builder.add_node("feasibility_check", feasibility_check)
 deep_researcher_builder.add_node("parallel_research", parallel_research)
+deep_researcher_builder.add_node("verify_requirements", verify_requirements)
 deep_researcher_builder.add_node("evidence_coverage", evidence_coverage)
 deep_researcher_builder.add_node("supplemental_research", parallel_research)
 deep_researcher_builder.add_node("review_and_score", review_and_score)
@@ -652,7 +568,8 @@ deep_researcher_builder.add_conditional_edges(
 )
 deep_researcher_builder.add_edge("confirm_plan", "feasibility_check")
 deep_researcher_builder.add_edge("feasibility_check", "parallel_research")
-deep_researcher_builder.add_edge("parallel_research", "evidence_coverage")
+deep_researcher_builder.add_edge("parallel_research", "verify_requirements")
+deep_researcher_builder.add_edge("verify_requirements", "evidence_coverage")
 deep_researcher_builder.add_conditional_edges(
     "evidence_coverage",
     _route_after_coverage,
@@ -661,7 +578,7 @@ deep_researcher_builder.add_conditional_edges(
         "review_and_score": "review_and_score",
     },
 )
-deep_researcher_builder.add_edge("supplemental_research", "evidence_coverage")
+deep_researcher_builder.add_edge("supplemental_research", "verify_requirements")
 deep_researcher_builder.add_edge("review_and_score", "generate_report")
 deep_researcher_builder.add_edge("generate_report", END)
 
